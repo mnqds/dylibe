@@ -12,8 +12,14 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/sysctl.h>
-#import <sys/proc.h>
-#import <sys/ptrace.h>
+/* iOS SDK 不提供 <sys/ptrace.h> / <sys/proc.h>：ptrace 原型与 P_TRACED 自行声明 */
+extern int ptrace(int _request, int _pid, void *_addr, int _data);
+#ifndef P_TRACED
+#define P_TRACED 0x00000800
+#endif
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <stdlib.h>
