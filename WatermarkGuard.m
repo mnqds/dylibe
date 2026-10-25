@@ -60,10 +60,12 @@ extern int ptrace(int _request, int _pid, void *_addr, int _data);
 /* ============================================================================
  * 二、常量配置（部署前必改）
  * ==========================================================================*/
-static NSString *const kWGVerifyURL        = @"https://example.com/api/verify"; // ← 改成你自己的验证接口
+static NSString *const kWGVerifyURL        = @"https://lib.ggboog.xin/verify.php"; // 卡密验证接口
 static NSString *const kWGCardDefaultsKey  = @"licenseCode";                    // ← 卡密在 NSUserDefaults 的字段名
 static NSString *const kWGAppID            = @"app_001";                        // ← 多软件隔离用
 static NSString *const kWGPlatform         = @"ios";
+static NSString *const kWGNoticeSeenKey    = @"wg_notice_seen";                  // 已展示过的公告 ID
+static NSString *const kWGServiceCacheKey  = @"wg_service_cache";               // 缓存的客服信息
 static NSString *const kWGDefaultWaterText = @"未授权 · 请激活";                 // 接口返回空 water_text 时的兜底文案
 static NSString *const kWGRiskLevel1Text   = @"⚠ 运行环境异常";                  // 一级异常追加到水印的文字
 static NSString *const kWGPinnedCertSHA256 = @"";                               // 开启 Pinning 时填证书 SHA256(hex)
@@ -81,6 +83,7 @@ static const NSInteger      kWGAnomalyExitLevel  = 3;     // 连续 N 次强制�
  * ==========================================================================*/
 static UIWindow *gOverlayWindow = nil;
 static UILabel  *gWaterLabel    = nil;
+static UIButton *gActivateBtn   = nil;   // 右下角/右上角「卡密激活」入口
 static NSString *gWaterText     = nil;   // 接口下发的文案
 static NSString *gRiskText      = nil;   // 安全模块追加的风险文案
 static BOOL      gWaterHidden   = YES;   // YES = 无水印
@@ -90,6 +93,7 @@ static int       gSceneRetry    = 0;    // 等待 UIWindowScene 的重试计数
 static NSMutableDictionary<NSString *, NSNumber *> *gAnomalyCounts = nil;
 static NSMutableSet<NSString *> *gAlertedItems = nil;
 static uint32_t  gSelfFingerprint = 0;
+static NSTimeInterval gLastActivationTry = 0;   // 用户手动点「激活」的时间（用于失败提示）
 
 static dispatch_queue_t gVerifyQueue = NULL;
 static dispatch_queue_t gSecurityQueue = NULL;
@@ -104,6 +108,9 @@ static void WGSetRiskText(NSString *text);
 static void WGShowAnomalyAlert(NSString *message);
 static void WGPerformVerify(void);
 static BOOL WGIsAppActive(void);
+static void WGShowActivationPanel(void);
+static void WGApplyRemoteInfo(NSDictionary *d);
+static void WGShowInfoAlert(NSString *title, NSString *message);
 
 /* ============================================================================
  * 四、通用小工具
@@ -181,15 +188,32 @@ static UIWindowScene *WGActiveWindowScene(void) {
 /* ============================================================================
  * 五、水印 UI（独立 Window，不侵入宿主视图）
  * ==========================================================================*/
+/* 全屏透明窗口默认会吞掉宿主的触摸：
+ * 命中空白区域时返回 nil，让触摸穿透到下层宿主窗口；只有按钮等可交互子视图才拦截。 */
+@interface WGPassThroughView : UIView
+@end
+
+@implementation WGPassThroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (!v || v == self) return nil;
+    return v;
+}
+@end
+
 @interface WGOverlayController : UIViewController
+- (void)onActivateTap:(id)sender;
 @end
 
 @implementation WGOverlayController
 - (void)loadView {
-    UIView *v = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    WGPassThroughView *v = [[WGPassThroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     v.backgroundColor = [UIColor clearColor];
-    v.userInteractionEnabled = NO;
+    v.userInteractionEnabled = YES;
     self.view = v;
+}
+- (void)onActivateTap:(id)sender {
+    WGShowActivationPanel();
 }
 - (BOOL)shouldAutorotate { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
@@ -264,8 +288,27 @@ static void WGEnsureOverlay(void) {
             [l.trailingAnchor constraintLessThanOrEqualToAnchor:w.trailingAnchor constant:-12.0],
         ]];
 
+        // 右上角「卡密激活」入口：未授权时显示，点击弹输入框
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        [b setTitle:@"卡密激活" forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor colorWithWhite:0.12 alpha:1.0] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:11.0];
+        b.backgroundColor = [UIColor colorWithWhite:0.97 alpha:0.9];
+        b.layer.cornerRadius = 11.0;
+        b.translatesAutoresizingMaskIntoConstraints = NO;
+        b.hidden = YES;
+        [b addTarget:vc action:@selector(onActivateTap:) forControlEvents:UIControlEventTouchUpInside];
+        [w addSubview:b];
+        [NSLayoutConstraint activateConstraints:@[
+            [b.trailingAnchor constraintEqualToAnchor:w.trailingAnchor constant:-12.0],
+            [b.topAnchor constraintEqualToAnchor:w.safeAreaLayoutGuide.topAnchor constant:8.0],
+            [b.widthAnchor constraintEqualToConstant:72.0],
+            [b.heightAnchor constraintEqualToConstant:24.0],
+        ]];
+
         gOverlayWindow = w;
         gWaterLabel = l;
+        gActivateBtn = b;
         WGLog(@"overlay window created");
     } @catch (...) {
         WGLog(@"ensure overlay failed");
@@ -292,11 +335,12 @@ static void WGApplyWatermark(void) {
             }
         }
         gWaterLabel.text = text;
-        gOverlayWindow.hidden = (text.length == 0);
-        if (text.length == 0) {
-            gOverlayWindow.userInteractionEnabled = NO;
-            gOverlayWindow.rootViewController.view.userInteractionEnabled = NO;
-        }
+        BOOL show = (text.length != 0);
+        gOverlayWindow.hidden = !show;
+        // 有内容时才允许交互（点击由 WGPassThroughView 过滤，空白处仍穿透给宿主）
+        gOverlayWindow.userInteractionEnabled = show;
+        gOverlayWindow.rootViewController.view.userInteractionEnabled = show;
+        if (gActivateBtn) gActivateBtn.hidden = gWaterHidden;   // 已授权就收起激活入口
     } @catch (...) {
         WGLog(@"apply watermark failed");
     }
@@ -324,6 +368,153 @@ static void WGSetRiskText(NSString *text) {
                 WGApplyWatermark();
             } @catch (...) {}
         });
+    } @catch (...) {}
+}
+
+/* ============================================================================
+ * 五之二、卡密激活入口 / 远程公告 / 客服信息
+ * ==========================================================================*/
+
+/// 拼接缓存的客服信息，用于激活窗口里的说明文字
+static NSString *WGServiceSummary(void) {
+    @try {
+        NSDictionary *s = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kWGServiceCacheKey];
+        if (![s isKindOfClass:[NSDictionary class]]) return nil;
+        NSMutableArray *parts = [NSMutableArray array];
+        id note = s[@"note"];
+        if ([note isKindOfClass:[NSString class]] && [(NSString *)note length]) [parts addObject:note];
+        id wx = s[@"wechat"];
+        if ([wx isKindOfClass:[NSString class]] && [(NSString *)wx length]) [parts addObject:[@"微信：" stringByAppendingString:wx]];
+        id qq = s[@"qq"];
+        if ([qq isKindOfClass:[NSString class]] && [(NSString *)qq length]) [parts addObject:[@"QQ：" stringByAppendingString:qq]];
+        id url = s[@"url"];
+        if ([url isKindOfClass:[NSString class]] && [(NSString *)url length]) [parts addObject:url];
+        return parts.count ? [parts componentsJoinedByString:@"\n"] : nil;
+    } @catch (...) {
+        return nil;
+    }
+}
+
+static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            WGEnsureOverlay();
+            UIViewController *host = gOverlayWindow.rootViewController;
+            if (!host) return;
+            if (host.presentedViewController) {
+                if (attempt < 3) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ WGShowInfoAlertRetry(title, message, attempt + 1); });
+                }
+                return;
+            }
+            gOverlayWindow.hidden = NO;
+            gOverlayWindow.userInteractionEnabled = YES;
+            host.view.userInteractionEnabled = YES;
+
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                       message:message
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault
+                                                 handler:^(UIAlertAction *a) { WGApplyWatermark(); }]];
+            [host presentViewController:ac animated:YES completion:nil];
+        } @catch (...) {}
+    });
+}
+
+static void WGShowInfoAlert(NSString *title, NSString *message) {
+    WGShowInfoAlertRetry(title, message, 0);
+}
+
+static void WGShowActivationPanelRetry(int attempt) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            WGEnsureOverlay();
+            UIViewController *host = gOverlayWindow.rootViewController;
+            if (!host) {
+                if (attempt < 3) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ WGShowActivationPanelRetry(attempt + 1); });
+                }
+                return;
+            }
+            if (host.presentedViewController) return;
+
+            gOverlayWindow.hidden = NO;
+            gOverlayWindow.userInteractionEnabled = YES;
+            host.view.userInteractionEnabled = YES;
+
+            NSString *svc = WGServiceSummary();
+            NSString *msg = svc.length ? svc : @"输入卡密后点「激活」。有效期由服务端计算，激活成功后水印自动消失。";
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"卡密激活"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                tf.placeholder = @"XXXX-XXXX-XXXX-XXXX";
+                id old = [[NSUserDefaults standardUserDefaults] objectForKey:kWGCardDefaultsKey];
+                if ([old isKindOfClass:[NSString class]]) tf.text = (NSString *)old;
+                tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+                tf.autocorrectionType = UITextAutocorrectionTypeNo;
+                tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+            }];
+            [ac addAction:[UIAlertAction actionWithTitle:@"激活" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                @try {
+                    NSString *code = ac.textFields.firstObject.text;
+                    code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                    if (code.length == 0) { WGApplyWatermark(); return; }
+                    [[NSUserDefaults standardUserDefaults] setObject:code forKey:kWGCardDefaultsKey];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+                    gLastActivationTry = [NSDate timeIntervalSinceReferenceDate];
+                    WGPerformVerify();
+                } @catch (...) {}
+            }]];
+            if (svc.length) {
+                [ac addAction:[UIAlertAction actionWithTitle:@"复制客服信息" style:UIAlertActionStyleDefault
+                                                     handler:^(UIAlertAction *a) {
+                    @try { [UIPasteboard generalPasteboard].string = svc; } @catch (...) {}
+                }]];
+            }
+            [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel
+                                                 handler:^(UIAlertAction *a) { WGApplyWatermark(); }]];
+            [host presentViewController:ac animated:YES completion:nil];
+        } @catch (...) {}
+    });
+}
+
+static void WGShowActivationPanel(void) {
+    WGShowActivationPanelRetry(0);
+}
+
+/// 解析服务端下发的公告与客服信息：客服缓存到本地；新公告只弹一次
+static void WGApplyRemoteInfo(NSDictionary *d) {
+    @try {
+        id svc = d[@"service"];
+        if ([svc isKindOfClass:[NSDictionary class]]) {
+            [[NSUserDefaults standardUserDefaults] setObject:svc forKey:kWGServiceCacheKey];
+        }
+
+        id nt = d[@"notice"];
+        if (![nt isKindOfClass:[NSDictionary class]]) return;
+        NSDictionary *n = (NSDictionary *)nt;
+        id c = n[@"content"];
+        if (![c isKindOfClass:[NSString class]] || [(NSString *)c length] == 0) return;
+
+        id rawId = n[@"id"];
+        NSString *nid = [rawId isKindOfClass:[NSString class]] ? (NSString *)rawId
+                       : ([rawId respondsToSelector:@selector(stringValue)] ? [rawId stringValue] : @"");
+        if (nid.length == 0) nid = (NSString *)c;
+
+        NSArray *seen = [[NSUserDefaults standardUserDefaults] arrayForKey:kWGNoticeSeenKey];
+        if ([seen containsObject:nid]) return;
+
+        NSMutableArray *arr = [NSMutableArray arrayWithArray:seen ?: @[]];
+        [arr addObject:nid];
+        while (arr.count > 20) [arr removeObjectAtIndex:0];
+        [[NSUserDefaults standardUserDefaults] setObject:arr forKey:kWGNoticeSeenKey];
+
+        id t = n[@"title"];
+        NSString *title = ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) ? (NSString *)t : @"公告";
+        WGShowInfoAlert(title, (NSString *)c);
     } @catch (...) {}
 }
 
@@ -441,6 +632,13 @@ static void WGPerformVerify(void) {
                     id t = d[@"water_text"];
                     NSString *text = [t isKindOfClass:[NSString class]] ? t : nil;
                     WGSetWatermark(pass ? YES : NO, text);
+                    WGApplyRemoteInfo(d);       // 公告 + 客服信息
+                    // 用户刚手动激活却失败 → 明确提示原因（定时校验的失败不打扰用户）
+                    if (!pass && text.length &&
+                        ([NSDate timeIntervalSinceReferenceDate] - gLastActivationTry) < 60.0) {
+                        gLastActivationTry = 0;
+                        WGShowInfoAlert(@"激活失败", text);
+                    }
                     WGLog(@"verify pass=%d", (int)pass);
                 } @catch (...) {
                     WGSetWatermark(YES, nil);
@@ -840,6 +1038,16 @@ void WGStart(void) {
         // UI：推迟到 App 启动完成、场景就绪后再创建
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ WGEnsureOverlay(); });
+
+        // 本地还没存过卡密 → 自动弹一次激活窗口，给用户一个入口
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                id old = [[NSUserDefaults standardUserDefaults] objectForKey:kWGCardDefaultsKey];
+                NSString *code = [old isKindOfClass:[NSString class]] ? (NSString *)old : nil;
+                if (code.length == 0) WGShowActivationPanel();
+            } @catch (...) {}
+        });
     } @catch (...) {
         WGLog(@"start failed");
     }
