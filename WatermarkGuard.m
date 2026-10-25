@@ -663,7 +663,9 @@ static BOOL WGHasSystemProxy(void) {
         if (n && CFGetTypeID(n) == CFNumberGetTypeID() &&
             CFNumberGetValue((CFNumberRef)n, kCFNumberIntType, &v) && v) on = YES;
         v = 0;
-        n = CFDictionaryGetValue(dict, kCFNetworkProxiesHTTPSEnable);
+        // kCFNetworkProxiesHTTPSEnable 是 macOS 常量，iOS SDK 标记为不可用；
+        // iOS 下字典里同样存在 "HTTPSEnable" 键，用字符串键取即可。
+        n = CFDictionaryGetValue(dict, (__bridge CFStringRef)@"HTTPSEnable");
         if (n && CFGetTypeID(n) == CFNumberGetTypeID() &&
             CFNumberGetValue((CFNumberRef)n, kCFNumberIntType, &v) && v) on = YES;
         CFRelease(dict);
