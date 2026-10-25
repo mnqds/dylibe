@@ -251,7 +251,7 @@ static void WGEnsureOverlay(void) {
         l.backgroundColor = [UIColor clearColor];
         l.userInteractionEnabled = NO;
         l.layer.shadowColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
-        l.layer.shadowOffset = CGSizeZero;
+        l.layer.shadowOffset = CGSizeMake(0, 0);   // 不用 CGSizeZero 全局符号（避免链接需要 CoreGraphics）
         l.layer.shadowRadius = 1.0;
         l.layer.shadowOpacity = 1.0;
         [w addSubview:l];
