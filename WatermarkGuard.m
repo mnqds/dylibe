@@ -62,7 +62,7 @@ extern int ptrace(int _request, int _pid, void *_addr, int _data);
  * ==========================================================================*/
 static NSString *const kWGVerifyURL        = @"https://lib.ggboog.xin/verify.php"; // 卡密验证接口
 static NSString *const kWGCardDefaultsKey  = @"licenseCode";                    // ← 卡密在 NSUserDefaults 的字段名
-static NSString *const kWGAppID            = @"app_001";                        // ← 多软件隔离用
+static NSString *const kWGAppID            = @"app_001";                        // 默认应用标识（Info.plist 配了 WGAppID 时以它为准）
 static NSString *const kWGPlatform         = @"ios";
 static NSString *const kWGNoticeSeenKey    = @"wg_notice_seen";                  // 已展示过的公告 ID
 static NSString *const kWGServiceCacheKey  = @"wg_service_cache";               // 缓存的客服信息
@@ -173,6 +173,24 @@ static BOOL WGIsAppActive(void) {
         return gAppStateCache != 0;
     }
     return active;
+}
+
+/// 应用标识：优先读 Info.plist 的 WGAppID（同一个 dylib 服务多个 App，不用为每个包重新编译），
+/// 没配就用编译期常量 kWGAppID。后台「应用」列表里必须有这个标识，否则服务端拒绝。
+static NSString *WGAppIDValue(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @try {
+            id v = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"WGAppID"];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) {
+                NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (s.length) cached = [s copy];
+            }
+        } @catch (...) {}
+        if (!cached) cached = kWGAppID;
+    });
+    return cached;
 }
 
 /// 启动瞬间判断：上次验证通过且未超过 6 小时 → 先不给水印，等后台校验结果再决定
@@ -785,7 +803,7 @@ static void WGPerformVerify(void) {
             // 3) 组装表单（x-www-form-urlencoded，服务端更好兼容）
             NSString *body = [NSString stringWithFormat:@"code=%@&device_id=%@&app_id=%@&platform=%@",
                               WGURLEncode(code), WGURLEncode(deviceId),
-                              WGURLEncode(kWGAppID), WGURLEncode(kWGPlatform)];
+                              WGURLEncode(WGAppIDValue()), WGURLEncode(kWGPlatform)];
 
             NSURL *url = [NSURL URLWithString:kWGVerifyURL];
             if (!url) return;   // 地址配错：保持当前水印状态（未授权继续显示水印）
