@@ -857,7 +857,9 @@ static void WGPerformVerify(void) {
                     if (!pass && text.length &&
                         ([NSDate timeIntervalSinceReferenceDate] - gLastActivationTry) < 60.0) {
                         gLastActivationTry = 0;
-                        WGShowInfoAlert(@"激活失败", text);
+                        // 顺带给出该卡所属代理的客服信息，用户知道找谁续费/售后
+                        NSString *svc = WGServiceSummary();
+                        WGShowInfoAlert(@"激活失败", svc.length ? [text stringByAppendingFormat:@"\n\n%@", svc] : text);
                     }
                     WGLog(@"verify pass=%d", (int)pass);
                 } @catch (...) {
