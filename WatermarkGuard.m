@@ -615,9 +615,9 @@ static void WGShowActivationPanelRetry(int attempt) {
             gOverlayWindow.hidden = NO;
             gOverlayWindow.userInteractionEnabled = YES;
 
+            // 面板里不显示客服信息：此时还没输卡密，无法判断卡属于哪个代理，避免误导
             NSString *tips = @"输入卡密后点「激活」，激活成功后水印自动消失；不输入卡密也能继续使用 App，只是会一直保留水印。";
-            NSString *svc = WGServiceSummary();
-            NSString *msg = svc.length ? [tips stringByAppendingFormat:@"\n\n%@", svc] : tips;
+            NSString *msg = tips;
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"卡密激活"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
@@ -650,15 +650,6 @@ static void WGShowActivationPanelRetry(int attempt) {
             [tf0 addTarget:watcher action:@selector(onChanged:) forControlEvents:UIControlEventEditingChanged];
             objc_setAssociatedObject(ac, "WGCodeWatcherKey", watcher, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [watcher onChanged:tf0];    // 预填了旧卡密时直接可用
-            if (svc.length) {
-                [ac addAction:[UIAlertAction actionWithTitle:@"复制客服信息" style:UIAlertActionStyleDefault
-                                                     handler:^(UIAlertAction *a) {
-                    @try {
-                        [UIPasteboard generalPasteboard].string = svc;
-                        WGMakeOverlayKeyWindow(NO);
-                    } @catch (...) {}
-                }]];
-            }
             if (gStrictMode) {
                 // 严格模式：不激活就强制退出 App
                 [ac addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
@@ -850,7 +841,15 @@ static void WGPerformVerify(void) {
                                     completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
                 @try {
                     // 网络失败 / 返回异常：不改变当前状态（未授权继续显示水印，已授权保持无水印），避免断网即绕过
-                    if (err || data.length == 0) { WGLog(@"verify net error"); return; }
+                    if (err || data.length == 0) {
+                        WGLog(@"verify net error");
+                        // 用户手动点「激活」却没连上服务器，给个明确反馈，避免以为按钮没反应
+                        if (([NSDate timeIntervalSinceReferenceDate] - gLastActivationTry) < 60.0) {
+                            gLastActivationTry = 0;
+                            WGShowInfoAlert(@"激活失败", @"网络异常，未能连接验证服务器，请检查网络后重试。");
+                        }
+                        return;
+                    }
                     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
                     if (![obj isKindOfClass:[NSDictionary class]]) return;
                     NSDictionary *d = (NSDictionary *)obj;
@@ -872,6 +871,14 @@ static void WGPerformVerify(void) {
                         // 顺带给出该卡所属代理的客服信息，用户知道找谁续费/售后
                         NSString *svc = WGServiceSummary();
                         WGShowInfoAlert(@"激活失败", svc.length ? [text stringByAppendingFormat:@"\n\n%@", svc] : text);
+                    }
+                    // 手动激活成功 → 弹窗，并按这张卡所属代理显示客服信息
+                    if (pass && ([NSDate timeIntervalSinceReferenceDate] - gLastActivationTry) < 60.0) {
+                        gLastActivationTry = 0;
+                        NSString *svc = WGServiceSummary();
+                        NSString *head = @"已激活，水印已去除。";
+                        WGShowInfoAlert(@"激活成功",
+                                        svc.length ? [head stringByAppendingFormat:@"\n\n如需售后或续费，请联系：\n%@", svc] : head);
                     }
                     WGLog(@"verify pass=%d", (int)pass);
                 } @catch (...) {
