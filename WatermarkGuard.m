@@ -433,6 +433,13 @@ static void WGMakeOverlayKeyWindow(BOOL on) {
                 for (UIWindow *x in gOverlayWindow.windowScene.windows) {
                     if (x != gOverlayWindow && x.isKeyWindow) { prev = x; break; }
                 }
+                // 传统 AppDelegate 架构没有 windowScene，或者宿主窗口暂时不是 key：
+                // 退而取任意一个宿主窗口，否则面板关闭后键盘焦点回不到宿主输入框
+                if (!prev) {
+                    for (UIWindow *x in [UIApplication sharedApplication].windows) {
+                        if (x != gOverlayWindow && !x.hidden) { prev = x; break; }
+                    }
+                }
             } @catch (...) {}
             if (prev) gPrevKeyWindow = prev;
             [gOverlayWindow makeKeyWindow];
@@ -465,7 +472,12 @@ static void WGApplyWatermark(void) {
         }
         [(WGWatermarkView *)gWaterView setText:text];
         BOOL show = (text.length != 0);
-        gOverlayWindow.hidden = !show;
+        // 弹窗（公告/激活/提示）还挂在覆盖窗口上时不能把窗口藏掉，否则弹窗会连带消失；
+        // 弹窗关闭后的回调都会再调一次 WGApplyWatermark，那时再按 show 收窗口。
+        UIViewController *rv = gOverlayWindow.rootViewController;
+        if (show || !rv.presentedViewController) {
+            gOverlayWindow.hidden = !show;
+        }
         // 注意：这里不能再动 userInteractionEnabled。
         // 未授权时窗口要一直可交互，「输入卡密」按钮才点得动；
         // 而窗口上除按钮/弹窗以外的区域由 WGOverlayWindow.hitTest 返回 nil 直接穿透给宿主，
