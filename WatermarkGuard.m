@@ -95,8 +95,8 @@ static int       gSceneRetry    = 0;    // 等待 UIWindowScene 的重试计数
 static NSMutableDictionary<NSString *, NSNumber *> *gAnomalyCounts = nil;
 static NSMutableSet<NSString *> *gAlertedItems = nil;
 static uint32_t  gSelfFingerprint = 0;
-static NSTimeInterval gLastActivationTry = 0;   // 用户手动点「激活」的时间（用于失败提示）
-static BOOL    gStrictMode = NO;   // 严格模式：激活弹窗不给「关闭」；NO = 水印模式（关闭即退出 App）
+static volatile NSTimeInterval gLastActivationTry = 0;   // 用户手动点「激活」的时间（用于失败提示，跨线程读写）
+static volatile BOOL gStrictMode = NO;   // 严格模式：激活弹窗不给「关闭」；NO = 水印模式（关闭即退出 App）
 
 static dispatch_queue_t gVerifyQueue = NULL;
 static dispatch_queue_t gSecurityQueue = NULL;
@@ -190,6 +190,17 @@ static BOOL WGCachedPassValid(NSString *code) {
     }
 }
 
+/// 判断宿主是否采用 UIScene 生命周期。
+/// 场景型 App 用 initWithFrame: 建的 UIWindow 根本不会显示，所以不能回落 legacy 窗口。
+static BOOL WGAppUsesScenes(void) {
+    @try {
+        if ([UIApplication sharedApplication].connectedScenes.count > 0) return YES;
+        id m = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIApplicationSceneManifest"];
+        if ([m isKindOfClass:[NSDictionary class]]) return YES;
+    } @catch (...) {}
+    return NO;
+}
+
 static UIWindowScene *WGActiveWindowScene(void) {
     @try {
         UIWindowScene *fallback = nil;
@@ -220,6 +231,8 @@ static UIWindowScene *WGActiveWindowScene(void) {
         self.backgroundColor = [UIColor clearColor];
         self.opaque = NO;
         self.userInteractionEnabled = YES;
+        // 旋转/尺寸变化时把画布拉伸会糊，必须重绘
+        self.contentMode = UIViewContentModeRedraw;
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     }
     return self;
@@ -292,12 +305,15 @@ static void WGEnsureOverlay(void) {
         // 水印文案的显隐由 WGApplyWatermark 里的 WG_ENABLE_WATERMARK 单独控制，窗口平时保持 hidden。
 
         if (gOverlayWindow) {
-            // 多窗口/多场景切换时重新挂载，避免水印挂在已失活的场景上
+            // 多窗口/多场景切换时重新挂载：窗口挂在「非前台激活」的 scene 上是不可见的，
+            // 只要当前 scene 不是 ForegroundActive 就换到活跃 scene 上
             UIWindowScene *cur = gOverlayWindow.windowScene;
-            if (!cur) {
+            if (!cur || cur.activationState != UISceneActivationStateForegroundActive) {
                 UIWindowScene *s2 = WGActiveWindowScene();
-                if (s2) gOverlayWindow.windowScene = s2;
-                cur = gOverlayWindow.windowScene;
+                if (s2) {
+                    gOverlayWindow.windowScene = s2;
+                    cur = s2;
+                }
             }
             // 注意：无 scene（传统 AppDelegate 架构）时不能取 coordinateSpace.bounds，否则 frame 归零
             gOverlayWindow.frame = cur ? cur.coordinateSpace.bounds : [UIScreen mainScreen].bounds;
@@ -306,16 +322,19 @@ static void WGEnsureOverlay(void) {
 
         UIWindowScene *ws = WGActiveWindowScene();
         if (!ws) {
-            // 场景还没就绪（SwiftUI / SceneDelegate 启动瞬间）：1 秒后重试。
-            // 传统 AppDelegate 架构（Info.plist 无 UIApplicationSceneManifest）本就无 scene，
-            // 重试 3 次后回落为「无 scene 的 UIWindow」，保证老架构 App 也能显示水印。
-            if (gSceneRetry < 3) {
-                gSceneRetry++;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ WGEnsureOverlay(); });
+            if (WGAppUsesScenes()) {
+                // 场景型 App（SwiftUI / SceneDelegate）启动瞬间 scene 可能还没就绪。
+                // 这种 App 用 initWithFrame: 建的窗口不会显示，绝不能回落成 legacy 窗口，
+                // 否则未授权状态下直接裸奔。有限重试，之后交给 4 秒看门狗继续补。
+                if (gSceneRetry < 20) {
+                    gSceneRetry++;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ WGEnsureOverlay(); });
+                }
                 return;
             }
-            WGLog(@"no window scene, fallback to legacy UIWindow");
+            // 传统 AppDelegate 架构（Info.plist 无 UIApplicationSceneManifest）：直接建 legacy 窗口
+            WGLog(@"legacy app, use plain UIWindow");
         }
 
         UIWindow *w = ws ? [[UIWindow alloc] initWithWindowScene:ws]
@@ -1052,6 +1071,7 @@ static void WGStartGuardTimer(void) {
                                   (uint64_t)(4 * NSEC_PER_SEC), (uint64_t)(1 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(t, ^{
             @try {
+                if (!WG_ENABLE_WATERMARK) return;       // 水印功能关闭时别造出看不见的全屏触摸拦截层
                 if (gWaterHidden) return;              // 已授权：窗口保持隐藏
                 WGEnsureOverlay();
                 if (!gOverlayWindow) return;
