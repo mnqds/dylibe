@@ -73,7 +73,7 @@ static NSString *const kWGRiskLevel1Text   = @"⚠ 运行环境异常";         
 static NSString *const kWGPinnedCertSHA256 = @"";                               // 开启 Pinning 时填证书 SHA256(hex)
 static NSString *const kWGHTTPHookKeyword  = @"/api/";                          // 仅拦截 URL 含此关键字的 POST 请求
 
-static const NSTimeInterval kWGFirstDelay       = 60.0;   // 首次校验延迟（秒）
+static const NSTimeInterval kWGFirstDelay       = 2.0;    // 首次校验延迟（秒）：启动后立即校验，公告/客服/卡密状态不用等
 static const NSTimeInterval kWGVerifyInterval   = 120.0;  // 前台校验间隔（秒）
 static const NSTimeInterval kWGSecurityInterval = 60.0;   // 安全复检间隔（秒）
 static const NSTimeInterval kWGRequestTimeout   = 10.0;   // 验证请求超时（秒）
@@ -440,7 +440,7 @@ static NSString *WGServiceSummary(void) {
     }
 }
 
-static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt) {
+static void WGShowInfoAlertRetry(NSString *title, NSString *message, NSString *markKey, int attempt) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             WGEnsureOverlay();
@@ -449,7 +449,7 @@ static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt
             if (host.presentedViewController) {
                 if (attempt < 3) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{ WGShowInfoAlertRetry(title, message, attempt + 1); });
+                                   dispatch_get_main_queue(), ^{ WGShowInfoAlertRetry(title, message, markKey, attempt + 1); });
                 }
                 return;
             }
@@ -462,13 +462,23 @@ static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) { WGApplyWatermark(); }]];
-            [host presentViewController:ac animated:YES completion:nil];
+            [host presentViewController:ac animated:YES completion:^{
+                @try {
+                    if (markKey.length) {   // 真正弹出后才记为「已读」，避免被挡住导致公告丢失
+                        NSArray *seen = [[NSUserDefaults standardUserDefaults] arrayForKey:kWGNoticeSeenKey];
+                        NSMutableArray *arr = [NSMutableArray arrayWithArray:seen ?: @[]];
+                        if (![arr containsObject:markKey]) [arr addObject:markKey];
+                        while (arr.count > 20) [arr removeObjectAtIndex:0];
+                        [[NSUserDefaults standardUserDefaults] setObject:arr forKey:kWGNoticeSeenKey];
+                    }
+                } @catch (...) {}
+            }];
         } @catch (...) {}
     });
 }
 
 static void WGShowInfoAlert(NSString *title, NSString *message) {
-    WGShowInfoAlertRetry(title, message, 0);
+    WGShowInfoAlertRetry(title, message, nil, 0);
 }
 
 static void WGShowActivationPanelRetry(int attempt) {
@@ -483,7 +493,13 @@ static void WGShowActivationPanelRetry(int attempt) {
                 }
                 return;
             }
-            if (host.presentedViewController) return;
+            if (host.presentedViewController) {
+                if (attempt < 4) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ WGShowActivationPanelRetry(attempt + 1); });
+                }
+                return;
+            }
 
             gOverlayWindow.hidden = NO;
             gOverlayWindow.userInteractionEnabled = YES;
@@ -506,7 +522,13 @@ static void WGShowActivationPanelRetry(int attempt) {
                 @try {
                     NSString *code = ac.textFields.firstObject.text;
                     code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                    if (code.length == 0) { WGApplyWatermark(); return; }
+                    if (code.length == 0) {
+                        // 没输卡密就点「激活」：明确提示，并把激活窗口重新弹出来
+                        WGShowInfoAlert(@"提示", @"请先输入卡密再点「激活」。");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{ WGShowActivationPanel(); });
+                        return;
+                    }
                     [[NSUserDefaults standardUserDefaults] setObject:code forKey:kWGCardDefaultsKey];
                     [[NSUserDefaults standardUserDefaults] synchronize];
                     gLastActivationTry = [NSDate timeIntervalSinceReferenceDate];
@@ -569,14 +591,10 @@ static void WGApplyRemoteInfo(NSDictionary *d) {
         NSArray *seen = [[NSUserDefaults standardUserDefaults] arrayForKey:kWGNoticeSeenKey];
         if ([seen containsObject:nid]) return;
 
-        NSMutableArray *arr = [NSMutableArray arrayWithArray:seen ?: @[]];
-        [arr addObject:nid];
-        while (arr.count > 20) [arr removeObjectAtIndex:0];
-        [[NSUserDefaults standardUserDefaults] setObject:arr forKey:kWGNoticeSeenKey];
-
         id t = n[@"title"];
         NSString *title = ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) ? (NSString *)t : @"公告";
-        WGShowInfoAlert(title, (NSString *)c);
+        // 弹出成功后才标记已读（markKey），避免被激活窗口挡住导致公告永久丢失
+        WGShowInfoAlertRetry(title, (NSString *)c, nid, 0);
     } @catch (...) {}
 }
 
@@ -642,30 +660,53 @@ static NSURLSession *WGMakeVerifySession(void) {
     }
 }
 
+/// 稳定设备号：优先用 Keychain 里持久化的一份（卸载重装也不变），避免卡密被误判为「换设备」
+static NSString *WGDeviceIdentifier(void) {
+    static NSString *cached = nil;
+    if (cached) return cached;
+    NSString *vid = nil;
+    @try { vid = [[[UIDevice currentDevice] identifierForVendor] UUIDString]; } @catch (...) {}
+    if (vid.length == 0) vid = [[NSUUID UUID] UUIDString];
+    @try {
+        NSDictionary *base = @{
+            (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: @"WatermarkGuard.device_id",
+            (__bridge id)kSecAttrAccount: @"device",
+        };
+        NSMutableDictionary *q = [base mutableCopy];
+        q[(__bridge id)kSecReturnData] = @YES;
+        q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+        CFTypeRef out = NULL;
+        if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &out) == errSecSuccess && out) {
+            NSString *s = [[NSString alloc] initWithData:(__bridge_transfer NSData *)out encoding:NSUTF8StringEncoding];
+            if (s.length) { cached = s; return cached; }
+        }
+        NSMutableDictionary *add = [base mutableCopy];
+        add[(__bridge id)kSecValueData] = [vid dataUsingEncoding:NSUTF8StringEncoding];
+        add[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+        OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+        if (st == errSecSuccess || st == errSecDuplicateItem) { cached = vid; return cached; }
+    } @catch (...) {}
+    cached = vid;
+    return cached;
+}
+
 static void WGPerformVerify(void) {
     @autoreleasepool {
         @try {
             if (!WG_ENABLE_VERIFY) return;
 
-            // 1) 读取卡密：读不到直接跳过本次请求（不改变当前水印状态）
+            // 1) 读取卡密：即使为空也要发请求——服务端会在 pass=false 的响应里带上公告/客服/模式
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             id raw = [ud objectForKey:kWGCardDefaultsKey];
             NSString *code = nil;
             if ([raw isKindOfClass:[NSString class]]) code = (NSString *)raw;
             else if ([raw isKindOfClass:[NSNumber class]]) code = [(NSNumber *)raw stringValue];
             code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (code.length == 0) {
-                WGLog(@"no card code, skip");
-                return;
-            }
+            if (!code) code = @"";
 
             // 2) 设备号
-            NSString *deviceId = @"";
-            @try {
-                deviceId = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
-            } @catch (...) {
-                deviceId = @"";
-            }
+            NSString *deviceId = WGDeviceIdentifier();
 
             // 3) 组装表单（x-www-form-urlencoded，服务端更好兼容）
             NSString *body = [NSString stringWithFormat:@"code=%@&device_id=%@&app_id=%@&platform=%@",
@@ -673,7 +714,7 @@ static void WGPerformVerify(void) {
                               WGURLEncode(kWGAppID), WGURLEncode(kWGPlatform)];
 
             NSURL *url = [NSURL URLWithString:kWGVerifyURL];
-            if (!url) { WGSetWatermark(YES, nil); return; }
+            if (!url) return;   // 地址配错：保持当前水印状态（未授权依旧锁屏）
 
             NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
             req.HTTPMethod = @"POST";
@@ -681,14 +722,15 @@ static void WGPerformVerify(void) {
             [req setValue:@"application/x-www-form-urlencoded; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
             req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
 
-            // 4) 请求 + 解析（任何异常一律静默降级：隐藏水印）
+            // 4) 请求 + 解析（网络/解析异常时保持当前状态，不放行也不误锁）
             NSURLSessionDataTask *task =
             [WGMakeVerifySession() dataTaskWithRequest:req
                                     completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
                 @try {
-                    if (err || data.length == 0) { WGSetWatermark(YES, nil); return; }
+                    // 网络失败 / 返回异常：不改变当前状态（未授权保持锁屏，已授权保持可用），避免断网即绕过
+                    if (err || data.length == 0) { WGLog(@"verify net error"); return; }
                     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
-                    if (![obj isKindOfClass:[NSDictionary class]]) { WGSetWatermark(YES, nil); return; }
+                    if (![obj isKindOfClass:[NSDictionary class]]) return;
                     NSDictionary *d = (NSDictionary *)obj;
                     BOOL pass = WGBoolValue(d[@"pass"]);
                     id t = d[@"water_text"];
@@ -709,12 +751,12 @@ static void WGPerformVerify(void) {
                     }
                     WGLog(@"verify pass=%d", (int)pass);
                 } @catch (...) {
-                    WGSetWatermark(YES, nil);
+                    WGLog(@"verify parse failed");
                 }
             }];
             [task resume];
         } @catch (...) {
-            WGSetWatermark(YES, nil);   // 超时 / 报错 / 格式异常 → 隐藏水印
+            WGLog(@"verify build failed");   // 保持当前状态，不因异常放行
         }
     }
 }
@@ -1000,6 +1042,28 @@ static void WGStartSecurityTimer(void) {
     } @catch (...) {}
 }
 
+/// 看门狗：每 4 秒确认「未授权时水印窗口一定可见」，防止宿主改 keyWindow / 系统回收导致裸奔
+static void WGStartGuardTimer(void) {
+    @try {
+        static dispatch_source_t t = NULL;
+        if (t) return;
+        t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                                  (uint64_t)(4 * NSEC_PER_SEC), (uint64_t)(1 * NSEC_PER_SEC));
+        dispatch_source_set_event_handler(t, ^{
+            @try {
+                if (gWaterHidden) return;              // 已授权：窗口保持隐藏
+                WGEnsureOverlay();
+                if (!gOverlayWindow) return;
+                if (gOverlayWindow.hidden) WGApplyWatermark();
+                if (gOverlayWindow.hidden) gOverlayWindow.hidden = NO;   // 兜底强显
+                gOverlayWindow.userInteractionEnabled = YES;
+            } @catch (...) {}
+        });
+        dispatch_resume(t);
+    } @catch (...) {}
+}
+
 /* ============================================================================
  * 八、可选：原生请求追加 Header（默认关闭）
  *   只加 Header，绝不改 Body；任何异常都退回原始请求
@@ -1110,14 +1174,16 @@ void WGStart(void) {
 #endif
         // 增强：安全复检（每 60 秒）
         WGStartSecurityTimer();
+        // 看门狗：未授权时保证水印窗口始终在最上层
+        WGStartGuardTimer();
 
         // UI：推迟到 App 启动完成、场景就绪后再创建
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ WGEnsureOverlay(); });
 
-        // 本地还没存过卡密 → 自动弹一次激活窗口，给用户一个入口
+        // 本地还没存过卡密 → 首次校验跑完（2 秒）后再弹激活窗口，此时客服信息已缓存
         gStrictMode = [[[NSUserDefaults standardUserDefaults] stringForKey:kWGModeCacheKey] isEqualToString:@"strict"];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
                 id old = [[NSUserDefaults standardUserDefaults] objectForKey:kWGCardDefaultsKey];
