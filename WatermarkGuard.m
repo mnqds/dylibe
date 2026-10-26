@@ -565,6 +565,21 @@ static void WGShowInfoAlert(NSString *title, NSString *message) {
     WGShowInfoAlertRetry(title, message, nil, 0);
 }
 
+/* 卡密输入框监听：内容为空时禁用「激活」按钮。
+ * UIControl 的 addTarget 不持有 target，所以用 associated object 把监听者挂在 Alert 上保活。 */
+@interface WGCodeWatcher : NSObject
+@property (nonatomic, weak) UIAlertAction *action;
+@end
+
+@implementation WGCodeWatcher
+- (void)onChanged:(UITextField *)tf {
+    @try {
+        NSString *s = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        self.action.enabled = (s.length > 0);
+    } @catch (...) {}
+}
+@end
+
 static void WGShowActivationPanelRetry(int attempt) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -602,24 +617,27 @@ static void WGShowActivationPanelRetry(int attempt) {
                 tf.autocorrectionType = UITextAutocorrectionTypeNo;
                 tf.clearButtonMode = UITextFieldViewModeWhileEditing;
             }];
-            [ac addAction:[UIAlertAction actionWithTitle:@"激活" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"激活" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                 @try {
                     WGMakeOverlayKeyWindow(NO);     // 面板即将关闭，先把焦点还给宿主
                     NSString *code = ac.textFields.firstObject.text;
                     code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                    if (code.length == 0) {
-                        // 没输卡密就点「激活」：明确提示，并把激活窗口重新弹出来
-                        WGShowInfoAlert(@"提示", @"请先输入卡密再点「激活」。");
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), ^{ WGShowActivationPanel(); });
-                        return;
-                    }
+                    if (code.length == 0) return;   // 兜底：按钮正常情况下是禁用的
                     [[NSUserDefaults standardUserDefaults] setObject:code forKey:kWGCardDefaultsKey];
                     [[NSUserDefaults standardUserDefaults] synchronize];
                     gLastActivationTry = [NSDate timeIntervalSinceReferenceDate];
                     WGPerformVerify();
                 } @catch (...) {}
-            }]];
+            }];
+            okAction.enabled = NO;      // 没输入卡密时点不动，避免弹窗被关掉又要重开
+            [ac addAction:okAction];
+
+            UITextField *tf0 = ac.textFields.firstObject;
+            WGCodeWatcher *watcher = [[WGCodeWatcher alloc] init];
+            watcher.action = okAction;
+            [tf0 addTarget:watcher action:@selector(onChanged:) forControlEvents:UIControlEventEditingChanged];
+            objc_setAssociatedObject(ac, "WGCodeWatcherKey", watcher, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [watcher onChanged:tf0];    // 预填了旧卡密时直接可用
             if (svc.length) {
                 [ac addAction:[UIAlertAction actionWithTitle:@"复制客服信息" style:UIAlertActionStyleDefault
                                                      handler:^(UIAlertAction *a) {
