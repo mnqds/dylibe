@@ -26,6 +26,7 @@ LDFLAGS := -dynamiclib \
            -install_name @executable_path/Frameworks/$(OBJ) \
            -framework Foundation \
            -framework UIKit \
+           -framework CoreGraphics \
            -framework Security \
            -framework CFNetwork
 
