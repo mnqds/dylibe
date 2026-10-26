@@ -67,12 +67,13 @@ static NSString *const kWGPlatform         = @"ios";
 static NSString *const kWGNoticeSeenKey    = @"wg_notice_seen";                  // 已展示过的公告 ID
 static NSString *const kWGServiceCacheKey  = @"wg_service_cache";               // 缓存的客服信息
 static NSString *const kWGModeCacheKey     = @"wg_verify_mode";                 // 服务端下发的验证模式 watermark / strict
+static NSString *const kWGPassCacheKey     = @"wg_pass_cache";                  // 上次验证通过的卡密 + 时间（用于启动瞬间的免水印判定）
 static NSString *const kWGDefaultWaterText = @"未授权 · 请激活";                 // 接口返回空 water_text 时的兜底文案
 static NSString *const kWGRiskLevel1Text   = @"⚠ 运行环境异常";                  // 一级异常追加到水印的文字
 static NSString *const kWGPinnedCertSHA256 = @"";                               // 开启 Pinning 时填证书 SHA256(hex)
 static NSString *const kWGHTTPHookKeyword  = @"/api/";                          // 仅拦截 URL 含此关键字的 POST 请求
 
-static const NSTimeInterval kWGFirstDelay       = 60.0;   // 首次校验延迟（秒）
+static const NSTimeInterval kWGFirstDelay       = 2.0;    // 首次校验延迟（秒）：启动后立即校验，公告/客服/卡密状态不用等
 static const NSTimeInterval kWGVerifyInterval   = 120.0;  // 前台校验间隔（秒）
 static const NSTimeInterval kWGSecurityInterval = 60.0;   // 安全复检间隔（秒）
 static const NSTimeInterval kWGRequestTimeout   = 10.0;   // 验证请求超时（秒）
@@ -83,7 +84,7 @@ static const NSInteger      kWGAnomalyExitLevel  = 3;     // 连续 N 次强制�
  * 三、内部状态
  * ==========================================================================*/
 static UIWindow *gOverlayWindow = nil;
-static UILabel  *gWaterLabel    = nil;
+static UIView   *gWaterView     = nil;   // 全屏平铺水印层（斜 30° 重复文字）
 static UIButton *gActivateBtn   = nil;   // 右下角/右上角「卡密激活」入口
 static NSString *gWaterText     = nil;   // 接口下发的文案
 static NSString *gRiskText      = nil;   // 安全模块追加的风险文案
@@ -95,8 +96,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *gAnomalyCounts = nil;
 static NSMutableSet<NSString *> *gAlertedItems = nil;
 static uint32_t  gSelfFingerprint = 0;
 static NSTimeInterval gLastActivationTry = 0;   // 用户手动点「激活」的时间（用于失败提示）
-static BOOL    gStrictMode = NO;   // 严格模式：验证失败全屏拦截；NO = 水印模式
-static UIView *gBlockView  = nil;  // 严格模式的拦截层
+static BOOL    gStrictMode = NO;   // 严格模式：激活弹窗不给「关闭」；NO = 水印模式（关闭即退出 App）
 
 static dispatch_queue_t gVerifyQueue = NULL;
 static dispatch_queue_t gSecurityQueue = NULL;
@@ -111,11 +111,10 @@ static void WGSetRiskText(NSString *text);
 static void WGShowAnomalyAlert(NSString *message);
 static void WGPerformVerify(void);
 static BOOL WGIsAppActive(void);
+static BOOL WGCachedPassValid(NSString *code);
 static void WGShowActivationPanel(void);
 static void WGApplyRemoteInfo(NSDictionary *d);
 static void WGShowInfoAlert(NSString *title, NSString *message);
-static void WGShowBlockScreen(NSString *reason);
-static void WGHideBlockScreen(void);
 static NSString *WGServiceSummary(void);
 
 /* ============================================================================
@@ -176,6 +175,21 @@ static BOOL WGIsAppActive(void) {
     return active;
 }
 
+/// 启动瞬间判断：上次验证通过且未超过 6 小时 → 先不给水印，等后台校验结果再决定
+static BOOL WGCachedPassValid(NSString *code) {
+    @try {
+        if (code.length == 0) return NO;
+        NSDictionary *c = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kWGPassCacheKey];
+        if (![c isKindOfClass:[NSDictionary class]]) return NO;
+        NSString *cc = c[@"code"];
+        if (![cc isKindOfClass:[NSString class]] || ![cc isEqualToString:code]) return NO;
+        double ts = [c[@"ts"] doubleValue];
+        return ([[NSDate date] timeIntervalSince1970] - ts) < 6 * 3600.0;
+    } @catch (...) {
+        return NO;
+    }
+}
+
 static UIWindowScene *WGActiveWindowScene(void) {
     @try {
         UIWindowScene *fallback = nil;
@@ -194,16 +208,52 @@ static UIWindowScene *WGActiveWindowScene(void) {
 /* ============================================================================
  * 五、水印 UI（独立 Window，不侵入宿主视图）
  * ==========================================================================*/
-/* 全屏透明窗口默认会吞掉宿主的触摸：
- * 命中空白区域时返回 nil，让触摸穿透到下层宿主窗口；只有按钮等可交互子视图才拦截。 */
-@interface WGPassThroughView : UIView
+/* 全屏平铺水印层：斜 30° 重复文字铺满整屏，并吞掉所有触摸（未授权时 App 不可操作）。
+ * 授权通过后窗口整体隐藏，触摸自然回到宿主 App。 */
+@interface WGWatermarkView : UIView
+@property (nonatomic, copy) NSString *text;
 @end
 
-@implementation WGPassThroughView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *v = [super hitTest:point withEvent:event];
-    if (!v || v == self) return nil;
-    return v;
+@implementation WGWatermarkView
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
+        self.userInteractionEnabled = YES;
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    }
+    return self;
+}
+- (void)setText:(NSString *)text {
+    _text = [text copy];
+    [self setNeedsDisplay];
+}
+- (void)drawRect:(CGRect)rect {
+    NSString *t = self.text.length ? self.text : kWGDefaultWaterText;
+    NSDictionary *attrs = @{
+        NSFontAttributeName: [UIFont systemFontOfSize:13.0],
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:0.35 alpha:0.22],
+    };
+    CGSize ts = [t sizeWithAttributes:attrs];
+    if (ts.width <= 0) return;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+    CGFloat diag = sqrt(W * W + H * H);
+    CGFloat stepX = ts.width + 72.0;
+    CGFloat stepY = ts.height + 86.0;
+
+    CGContextSaveGState(ctx);
+    CGContextTranslateCTM(ctx, W / 2.0, H / 2.0);
+    CGContextRotateCTM(ctx, -0.5236);           // -30°
+    CGFloat half = diag / 2.0 + stepX;
+    for (CGFloat y = -half; y <= half; y += stepY) {
+        for (CGFloat x = -half; x <= half; x += stepX) {
+            [t drawAtPoint:CGPointMake(x - ts.width / 2.0, y - ts.height / 2.0) withAttributes:attrs];
+        }
+    }
+    CGContextRestoreGState(ctx);
 }
 @end
 
@@ -214,7 +264,7 @@ static UIWindowScene *WGActiveWindowScene(void) {
 
 @implementation WGOverlayController
 - (void)loadView {
-    WGPassThroughView *v = [[WGPassThroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    UIView *v = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     v.backgroundColor = [UIColor clearColor];
     v.userInteractionEnabled = YES;
     self.view = v;
@@ -279,48 +329,30 @@ static void WGEnsureOverlay(void) {
         WGOverlayController *vc = [[WGOverlayController alloc] init];
         w.rootViewController = vc;
 
-        UILabel *l = [[UILabel alloc] init];
-        l.translatesAutoresizingMaskIntoConstraints = NO;
-        l.numberOfLines = 0;
-        l.textAlignment = NSTextAlignmentCenter;
-        l.font = [UIFont italicSystemFontOfSize:12.0];                       // 12 号斜体
-        l.textColor = [UIColor colorWithWhite:0.55 alpha:0.78];              // 半透明浅灰
-        l.backgroundColor = [UIColor clearColor];
-        l.userInteractionEnabled = NO;
-        l.layer.shadowColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
-        l.layer.shadowOffset = CGSizeMake(0, 0);   // 不用 CGSizeZero 全局符号（避免链接需要 CoreGraphics）
-        l.layer.shadowRadius = 1.0;
-        l.layer.shadowOpacity = 1.0;
-        [w addSubview:l];
+        WGWatermarkView *wm = [[WGWatermarkView alloc] initWithFrame:w.bounds];
+        wm.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [w addSubview:wm];
 
-        // 底部居中；Auto Layout 天然适配横竖屏与安全区
-        [NSLayoutConstraint activateConstraints:@[
-            [l.centerXAnchor constraintEqualToAnchor:w.centerXAnchor],
-            [l.bottomAnchor constraintEqualToAnchor:w.safeAreaLayoutGuide.bottomAnchor constant:-6.0],
-            [l.leadingAnchor constraintGreaterThanOrEqualToAnchor:w.leadingAnchor constant:12.0],
-            [l.trailingAnchor constraintLessThanOrEqualToAnchor:w.trailingAnchor constant:-12.0],
-        ]];
-
-        // 右上角「卡密激活」入口：未授权时显示，点击弹输入框
+        // 屏幕下方「输入卡密」按钮：未授权时唯一可点的东西
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        [b setTitle:@"卡密激活" forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor colorWithWhite:0.12 alpha:1.0] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:11.0];
-        b.backgroundColor = [UIColor colorWithWhite:0.97 alpha:0.9];
-        b.layer.cornerRadius = 11.0;
+        [b setTitle:@"输入卡密" forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
+        b.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.86];
+        b.layer.cornerRadius = 19.0;
         b.translatesAutoresizingMaskIntoConstraints = NO;
         b.hidden = YES;
         [b addTarget:vc action:@selector(onActivateTap:) forControlEvents:UIControlEventTouchUpInside];
         [w addSubview:b];
         [NSLayoutConstraint activateConstraints:@[
-            [b.trailingAnchor constraintEqualToAnchor:w.trailingAnchor constant:-12.0],
-            [b.topAnchor constraintEqualToAnchor:w.safeAreaLayoutGuide.topAnchor constant:8.0],
-            [b.widthAnchor constraintEqualToConstant:72.0],
-            [b.heightAnchor constraintEqualToConstant:24.0],
+            [b.centerXAnchor constraintEqualToAnchor:w.centerXAnchor],
+            [b.bottomAnchor constraintEqualToAnchor:w.safeAreaLayoutGuide.bottomAnchor constant:-36.0],
+            [b.widthAnchor constraintEqualToConstant:136.0],
+            [b.heightAnchor constraintEqualToConstant:38.0],
         ]];
 
         gOverlayWindow = w;
-        gWaterLabel = l;
+        gWaterView = wm;
         gActivateBtn = b;
         WGLog(@"overlay window created");
     } @catch (...) {
@@ -336,24 +368,24 @@ static void WGApplyWatermark(void) {
         }
         if (!WG_ENABLE_WATERMARK) return;
         WGEnsureOverlay();
-        if (!gOverlayWindow || !gWaterLabel) return;
+        if (!gOverlayWindow || !gWaterView) return;
 
         NSMutableString *text = [NSMutableString string];
         // 有风险提示时即使当前「无水印」也要显示（一级异常的处置就是追加文字）
         if (!gWaterHidden || gRiskText.length) {
             [text appendString:(gWaterText.length ? gWaterText : kWGDefaultWaterText)];
             if (gRiskText.length) {
-                if (text.length) [text appendString:@"\n"];
+                [text appendString:@" "];
                 [text appendString:gRiskText];
             }
         }
-        gWaterLabel.text = text;
+        [(WGWatermarkView *)gWaterView setText:text];
         BOOL show = (text.length != 0);
         gOverlayWindow.hidden = !show;
-        // 有内容时才允许交互（点击由 WGPassThroughView 过滤，空白处仍穿透给宿主）
+        // 显示时整窗拦截触摸：未授权状态下宿主 App 不可操作，只有「输入卡密」按钮可点
         gOverlayWindow.userInteractionEnabled = show;
         gOverlayWindow.rootViewController.view.userInteractionEnabled = show;
-        if (gActivateBtn) gActivateBtn.hidden = gWaterHidden;   // 已授权就收起激活入口
+        if (gActivateBtn) gActivateBtn.hidden = !show;   // 已授权（无水印）就收起激活入口
     } @catch (...) {
         WGLog(@"apply watermark failed");
     }
@@ -408,7 +440,7 @@ static NSString *WGServiceSummary(void) {
     }
 }
 
-static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt) {
+static void WGShowInfoAlertRetry(NSString *title, NSString *message, NSString *markKey, int attempt) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             WGEnsureOverlay();
@@ -417,7 +449,7 @@ static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt
             if (host.presentedViewController) {
                 if (attempt < 3) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{ WGShowInfoAlertRetry(title, message, attempt + 1); });
+                                   dispatch_get_main_queue(), ^{ WGShowInfoAlertRetry(title, message, markKey, attempt + 1); });
                 }
                 return;
             }
@@ -430,13 +462,23 @@ static void WGShowInfoAlertRetry(NSString *title, NSString *message, int attempt
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) { WGApplyWatermark(); }]];
-            [host presentViewController:ac animated:YES completion:nil];
+            [host presentViewController:ac animated:YES completion:^{
+                @try {
+                    if (markKey.length) {   // 真正弹出后才记为「已读」，避免被挡住导致公告丢失
+                        NSArray *seen = [[NSUserDefaults standardUserDefaults] arrayForKey:kWGNoticeSeenKey];
+                        NSMutableArray *arr = [NSMutableArray arrayWithArray:seen ?: @[]];
+                        if (![arr containsObject:markKey]) [arr addObject:markKey];
+                        while (arr.count > 20) [arr removeObjectAtIndex:0];
+                        [[NSUserDefaults standardUserDefaults] setObject:arr forKey:kWGNoticeSeenKey];
+                    }
+                } @catch (...) {}
+            }];
         } @catch (...) {}
     });
 }
 
 static void WGShowInfoAlert(NSString *title, NSString *message) {
-    WGShowInfoAlertRetry(title, message, 0);
+    WGShowInfoAlertRetry(title, message, nil, 0);
 }
 
 static void WGShowActivationPanelRetry(int attempt) {
@@ -451,7 +493,13 @@ static void WGShowActivationPanelRetry(int attempt) {
                 }
                 return;
             }
-            if (host.presentedViewController) return;
+            if (host.presentedViewController) {
+                if (attempt < 4) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ WGShowActivationPanelRetry(attempt + 1); });
+                }
+                return;
+            }
 
             gOverlayWindow.hidden = NO;
             gOverlayWindow.userInteractionEnabled = YES;
@@ -474,7 +522,13 @@ static void WGShowActivationPanelRetry(int attempt) {
                 @try {
                     NSString *code = ac.textFields.firstObject.text;
                     code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                    if (code.length == 0) { WGApplyWatermark(); return; }
+                    if (code.length == 0) {
+                        // 没输卡密就点「激活」：明确提示，并把激活窗口重新弹出来
+                        WGShowInfoAlert(@"提示", @"请先输入卡密再点「激活」。");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{ WGShowActivationPanel(); });
+                        return;
+                    }
                     [[NSUserDefaults standardUserDefaults] setObject:code forKey:kWGCardDefaultsKey];
                     [[NSUserDefaults standardUserDefaults] synchronize];
                     gLastActivationTry = [NSDate timeIntervalSinceReferenceDate];
@@ -487,8 +541,15 @@ static void WGShowActivationPanelRetry(int attempt) {
                     @try { [UIPasteboard generalPasteboard].string = svc; } @catch (...) {}
                 }]];
             }
-            [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel
-                                                 handler:^(UIAlertAction *a) { WGApplyWatermark(); }]];
+            if (gStrictMode) {
+                // 严格模式：不提供「关闭」，只能激活（不激活就强制退出 App）
+                [ac addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
+                                                     handler:^(UIAlertAction *a) { exit(0); }]];
+            } else {
+                // 水印模式：点「关闭」= 直接退出 App，不能关掉弹窗继续白用
+                [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDestructive
+                                                     handler:^(UIAlertAction *a) { exit(0); }]];
+            }
             [host presentViewController:ac animated:YES completion:nil];
         } @catch (...) {}
     });
@@ -530,102 +591,11 @@ static void WGApplyRemoteInfo(NSDictionary *d) {
         NSArray *seen = [[NSUserDefaults standardUserDefaults] arrayForKey:kWGNoticeSeenKey];
         if ([seen containsObject:nid]) return;
 
-        NSMutableArray *arr = [NSMutableArray arrayWithArray:seen ?: @[]];
-        [arr addObject:nid];
-        while (arr.count > 20) [arr removeObjectAtIndex:0];
-        [[NSUserDefaults standardUserDefaults] setObject:arr forKey:kWGNoticeSeenKey];
-
         id t = n[@"title"];
         NSString *title = ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) ? (NSString *)t : @"公告";
-        WGShowInfoAlert(title, (NSString *)c);
+        // 弹出成功后才标记已读（markKey），避免被激活窗口挡住导致公告永久丢失
+        WGShowInfoAlertRetry(title, (NSString *)c, nid, 0);
     } @catch (...) {}
-}
-
-/// 严格模式：全屏拦截层（仅「卡密激活」「复制客服信息」两个出口，不给关闭）
-static void WGShowBlockScreen(NSString *reason) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            WGEnsureOverlay();
-            if (!gOverlayWindow) return;
-            UIViewController *host = gOverlayWindow.rootViewController;
-            gOverlayWindow.hidden = NO;
-            gOverlayWindow.userInteractionEnabled = YES;
-            host.view.userInteractionEnabled = YES;
-
-            if (!gBlockView) {
-                CGFloat W = host.view.bounds.size.width;
-                CGFloat H = host.view.bounds.size.height;
-                UIViewAutoresizing centerMask = UIViewAutoresizingFlexibleTopMargin  | UIViewAutoresizingFlexibleBottomMargin |
-                                                UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
-
-                UIView *v = [[UIView alloc] initWithFrame:host.view.bounds];
-                v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-                v.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.97];
-
-                UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, H / 2 - 175, W, 30)];
-                title.text = @"未授权";
-                title.font = [UIFont boldSystemFontOfSize:19];
-                title.textColor = [UIColor whiteColor];
-                title.textAlignment = NSTextAlignmentCenter;
-                title.autoresizingMask = centerMask;
-                [v addSubview:title];
-
-                UILabel *msg = [[UILabel alloc] initWithFrame:CGRectMake(30, H / 2 - 125, W - 60, 70)];
-                msg.tag = 11;
-                msg.font = [UIFont systemFontOfSize:13];
-                msg.textColor = [UIColor colorWithWhite:0.85 alpha:1];
-                msg.textAlignment = NSTextAlignmentCenter;
-                msg.numberOfLines = 0;
-                msg.autoresizingMask = centerMask;
-                [v addSubview:msg];
-
-                UILabel *svc = [[UILabel alloc] initWithFrame:CGRectMake(30, H / 2 - 40, W - 60, 64)];
-                svc.tag = 12;
-                svc.font = [UIFont systemFontOfSize:12];
-                svc.textColor = [UIColor colorWithWhite:0.55 alpha:1];
-                svc.textAlignment = NSTextAlignmentCenter;
-                svc.numberOfLines = 0;
-                svc.autoresizingMask = centerMask;
-                [v addSubview:svc];
-
-                UIButton *act = [UIButton buttonWithType:UIButtonTypeSystem];
-                act.frame = CGRectMake(W / 2 - 90, H / 2 + 60, 180, 42);
-                [act setTitle:@"卡密激活" forState:UIControlStateNormal];
-                [act setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                act.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-                act.backgroundColor = [UIColor colorWithRed:0.15 green:0.39 blue:0.93 alpha:1];
-                act.layer.cornerRadius = 21;
-                act.autoresizingMask = centerMask;
-                [act addTarget:host action:@selector(onActivateTap:) forControlEvents:UIControlEventTouchUpInside];
-                [v addSubview:act];
-
-                UIButton *cp = [UIButton buttonWithType:UIButtonTypeSystem];
-                cp.frame = CGRectMake(W / 2 - 90, H / 2 + 116, 180, 32);
-                [cp setTitle:@"复制客服信息" forState:UIControlStateNormal];
-                [cp setTitleColor:[UIColor colorWithWhite:0.75 alpha:1] forState:UIControlStateNormal];
-                cp.titleLabel.font = [UIFont systemFontOfSize:12];
-                cp.autoresizingMask = centerMask;
-                [cp addTarget:host action:@selector(onCopyServiceTap:) forControlEvents:UIControlEventTouchUpInside];
-                [v addSubview:cp];
-
-                gBlockView = v;
-                [host.view addSubview:v];
-            }
-
-            UILabel *msg = [gBlockView viewWithTag:11];
-            if (msg) msg.text = reason.length ? reason : @"卡密无效或已到期";
-            UILabel *svc = [gBlockView viewWithTag:12];
-            if (svc) svc.text = WGServiceSummary();
-            gBlockView.hidden = NO;
-            if (gActivateBtn) gActivateBtn.hidden = YES;
-        } @catch (...) {}
-    });
-}
-
-static void WGHideBlockScreen(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try { if (gBlockView) gBlockView.hidden = YES; } @catch (...) {}
-    });
 }
 
 /* ============================================================================
@@ -690,30 +660,53 @@ static NSURLSession *WGMakeVerifySession(void) {
     }
 }
 
+/// 稳定设备号：优先用 Keychain 里持久化的一份（卸载重装也不变），避免卡密被误判为「换设备」
+static NSString *WGDeviceIdentifier(void) {
+    static NSString *cached = nil;
+    if (cached) return cached;
+    NSString *vid = nil;
+    @try { vid = [[[UIDevice currentDevice] identifierForVendor] UUIDString]; } @catch (...) {}
+    if (vid.length == 0) vid = [[NSUUID UUID] UUIDString];
+    @try {
+        NSDictionary *base = @{
+            (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: @"WatermarkGuard.device_id",
+            (__bridge id)kSecAttrAccount: @"device",
+        };
+        NSMutableDictionary *q = [base mutableCopy];
+        q[(__bridge id)kSecReturnData] = @YES;
+        q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+        CFTypeRef out = NULL;
+        if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &out) == errSecSuccess && out) {
+            NSString *s = [[NSString alloc] initWithData:(__bridge_transfer NSData *)out encoding:NSUTF8StringEncoding];
+            if (s.length) { cached = s; return cached; }
+        }
+        NSMutableDictionary *add = [base mutableCopy];
+        add[(__bridge id)kSecValueData] = [vid dataUsingEncoding:NSUTF8StringEncoding];
+        add[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+        OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+        if (st == errSecSuccess || st == errSecDuplicateItem) { cached = vid; return cached; }
+    } @catch (...) {}
+    cached = vid;
+    return cached;
+}
+
 static void WGPerformVerify(void) {
     @autoreleasepool {
         @try {
             if (!WG_ENABLE_VERIFY) return;
 
-            // 1) 读取卡密：读不到直接跳过本次请求（不改变当前水印状态）
+            // 1) 读取卡密：即使为空也要发请求——服务端会在 pass=false 的响应里带上公告/客服/模式
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             id raw = [ud objectForKey:kWGCardDefaultsKey];
             NSString *code = nil;
             if ([raw isKindOfClass:[NSString class]]) code = (NSString *)raw;
             else if ([raw isKindOfClass:[NSNumber class]]) code = [(NSNumber *)raw stringValue];
             code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (code.length == 0) {
-                WGLog(@"no card code, skip");
-                return;
-            }
+            if (!code) code = @"";
 
             // 2) 设备号
-            NSString *deviceId = @"";
-            @try {
-                deviceId = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
-            } @catch (...) {
-                deviceId = @"";
-            }
+            NSString *deviceId = WGDeviceIdentifier();
 
             // 3) 组装表单（x-www-form-urlencoded，服务端更好兼容）
             NSString *body = [NSString stringWithFormat:@"code=%@&device_id=%@&app_id=%@&platform=%@",
@@ -721,7 +714,7 @@ static void WGPerformVerify(void) {
                               WGURLEncode(kWGAppID), WGURLEncode(kWGPlatform)];
 
             NSURL *url = [NSURL URLWithString:kWGVerifyURL];
-            if (!url) { WGSetWatermark(YES, nil); return; }
+            if (!url) return;   // 地址配错：保持当前水印状态（未授权依旧锁屏）
 
             NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
             req.HTTPMethod = @"POST";
@@ -729,42 +722,41 @@ static void WGPerformVerify(void) {
             [req setValue:@"application/x-www-form-urlencoded; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
             req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
 
-            // 4) 请求 + 解析（任何异常一律静默降级：隐藏水印）
+            // 4) 请求 + 解析（网络/解析异常时保持当前状态，不放行也不误锁）
             NSURLSessionDataTask *task =
             [WGMakeVerifySession() dataTaskWithRequest:req
                                     completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
                 @try {
-                    if (err || data.length == 0) { WGSetWatermark(YES, nil); return; }
+                    // 网络失败 / 返回异常：不改变当前状态（未授权保持锁屏，已授权保持可用），避免断网即绕过
+                    if (err || data.length == 0) { WGLog(@"verify net error"); return; }
                     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
-                    if (![obj isKindOfClass:[NSDictionary class]]) { WGSetWatermark(YES, nil); return; }
+                    if (![obj isKindOfClass:[NSDictionary class]]) return;
                     NSDictionary *d = (NSDictionary *)obj;
                     BOOL pass = WGBoolValue(d[@"pass"]);
                     id t = d[@"water_text"];
                     NSString *text = [t isKindOfClass:[NSString class]] ? t : nil;
                     WGApplyRemoteInfo(d);       // 公告 + 客服 + 验证模式
-                    if (gStrictMode) {
-                        // 严格模式：不打水印，失败直接全屏拦截
-                        WGSetWatermark(YES, nil);
-                        if (pass) WGHideBlockScreen();
-                        else      WGShowBlockScreen(text.length ? text : @"卡密无效或已到期");
-                    } else {
-                        WGSetWatermark(pass ? YES : NO, text);
-                        WGHideBlockScreen();
+                    if (pass) {
+                        [[NSUserDefaults standardUserDefaults] setObject:
+                            @{ @"code": code, @"ts": @([[NSDate date] timeIntervalSince1970]) }
+                                                              forKey:kWGPassCacheKey];
                     }
+                    // 两种模式都是「全屏平铺水印 + 拦截触摸」，差别只在激活弹窗是否给「关闭」
+                    WGSetWatermark(pass ? YES : NO, text);
                     // 用户刚手动激活却失败 → 明确提示原因（定时校验的失败不打扰用户）
-                    if (!pass && text.length && !gStrictMode &&
+                    if (!pass && text.length &&
                         ([NSDate timeIntervalSinceReferenceDate] - gLastActivationTry) < 60.0) {
                         gLastActivationTry = 0;
                         WGShowInfoAlert(@"激活失败", text);
                     }
                     WGLog(@"verify pass=%d", (int)pass);
                 } @catch (...) {
-                    WGSetWatermark(YES, nil);
+                    WGLog(@"verify parse failed");
                 }
             }];
             [task resume];
         } @catch (...) {
-            WGSetWatermark(YES, nil);   // 超时 / 报错 / 格式异常 → 隐藏水印
+            WGLog(@"verify build failed");   // 保持当前状态，不因异常放行
         }
     }
 }
@@ -1050,6 +1042,28 @@ static void WGStartSecurityTimer(void) {
     } @catch (...) {}
 }
 
+/// 看门狗：每 4 秒确认「未授权时水印窗口一定可见」，防止宿主改 keyWindow / 系统回收导致裸奔
+static void WGStartGuardTimer(void) {
+    @try {
+        static dispatch_source_t t = NULL;
+        if (t) return;
+        t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                                  (uint64_t)(4 * NSEC_PER_SEC), (uint64_t)(1 * NSEC_PER_SEC));
+        dispatch_source_set_event_handler(t, ^{
+            @try {
+                if (gWaterHidden) return;              // 已授权：窗口保持隐藏
+                WGEnsureOverlay();
+                if (!gOverlayWindow) return;
+                if (gOverlayWindow.hidden) WGApplyWatermark();
+                if (gOverlayWindow.hidden) gOverlayWindow.hidden = NO;   // 兜底强显
+                gOverlayWindow.userInteractionEnabled = YES;
+            } @catch (...) {}
+        });
+        dispatch_resume(t);
+    } @catch (...) {}
+}
+
 /* ============================================================================
  * 八、可选：原生请求追加 Header（默认关闭）
  *   只加 Header，绝不改 Body；任何异常都退回原始请求
@@ -1143,6 +1157,14 @@ void WGStart(void) {
         WGInstallURLSessionHook();
 #endif
 
+        // 启动瞬间先定调：本地没卡密（或缓存过期）→ 立刻铺满水印，不能白等首次校验的 60 秒
+        {
+            id old = [[NSUserDefaults standardUserDefaults] objectForKey:kWGCardDefaultsKey];
+            NSString *code = [old isKindOfClass:[NSString class]] ? (NSString *)old : nil;
+            BOOL trusted = WGCachedPassValid(code);
+            if (WG_ENABLE_WATERMARK) WGSetWatermark(trusted ? YES : NO, nil);
+        }
+
         // 核心：验证定时器（首次 1 分钟后）
 #if WG_ENABLE_VERIFY
         WGStartVerifyTimer();
@@ -1152,14 +1174,16 @@ void WGStart(void) {
 #endif
         // 增强：安全复检（每 60 秒）
         WGStartSecurityTimer();
+        // 看门狗：未授权时保证水印窗口始终在最上层
+        WGStartGuardTimer();
 
         // UI：推迟到 App 启动完成、场景就绪后再创建
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ WGEnsureOverlay(); });
 
-        // 本地还没存过卡密 → 自动弹一次激活窗口，给用户一个入口
+        // 本地还没存过卡密 → 首次校验跑完（2 秒）后再弹激活窗口，此时客服信息已缓存
         gStrictMode = [[[NSUserDefaults standardUserDefaults] stringForKey:kWGModeCacheKey] isEqualToString:@"strict"];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
                 id old = [[NSUserDefaults standardUserDefaults] objectForKey:kWGCardDefaultsKey];
