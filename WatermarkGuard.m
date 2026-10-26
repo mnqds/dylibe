@@ -96,7 +96,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *gAnomalyCounts = nil;
 static NSMutableSet<NSString *> *gAlertedItems = nil;
 static uint32_t  gSelfFingerprint = 0;
 static volatile NSTimeInterval gLastActivationTry = 0;   // 用户手动点「激活」的时间（用于失败提示，跨线程读写）
-static volatile BOOL gStrictMode = NO;   // 严格模式：激活弹窗不给「关闭」；NO = 水印模式（关闭即退出 App）
+static volatile BOOL gStrictMode = NO;   // 严格模式：激活弹窗只有「激活/退出」，不激活就退出；NO = 水印模式（可关闭弹窗继续用，水印保留）
 
 static dispatch_queue_t gVerifyQueue = NULL;
 static dispatch_queue_t gSecurityQueue = NULL;
@@ -219,8 +219,8 @@ static UIWindowScene *WGActiveWindowScene(void) {
 /* ============================================================================
  * 五、水印 UI（独立 Window，不侵入宿主视图）
  * ==========================================================================*/
-/* 全屏平铺水印层：斜 30° 重复文字铺满整屏，并吞掉所有触摸（未授权时 App 不可操作）。
- * 授权通过后窗口整体隐藏，触摸自然回到宿主 App。 */
+/* 全屏平铺水印层：斜 30° 重复文字铺满整屏，只负责「画」，不参与触摸。
+ * 未授权时 App 依然可以正常操作，只有底部「输入卡密」按钮和验证弹窗接收触摸。 */
 @interface WGWatermarkView : UIView
 @property (nonatomic, copy) NSString *text;
 @end
@@ -230,7 +230,8 @@ static UIWindowScene *WGActiveWindowScene(void) {
     if ((self = [super initWithFrame:frame])) {
         self.backgroundColor = [UIColor clearColor];
         self.opaque = NO;
-        self.userInteractionEnabled = YES;
+        // 水印只是画上去，不吞触摸：没卡也能正常操作 App
+        self.userInteractionEnabled = NO;
         // 旋转/尺寸变化时把画布拉伸会糊，必须重绘
         self.contentMode = UIViewContentModeRedraw;
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -267,6 +268,23 @@ static UIWindowScene *WGActiveWindowScene(void) {
         }
     }
     CGContextRestoreGState(ctx);
+}
+@end
+
+/* 水印窗口：只让「输入卡密」按钮和弹窗接收触摸，其余区域的触摸全部透传给宿主 App。
+ * 这样没卡也能正常用 App，只是画面带水印。 */
+@interface WGOverlayWindow : UIWindow
+@end
+
+@implementation WGOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (!v) return nil;
+    // 弹窗（激活/公告/提示）展示期间正常接收，否则按钮点不动
+    if (self.rootViewController.presentedViewController) return v;
+    // 空白区 / 水印层 / 根视图 → 返回 nil，事件交给下面的宿主窗口
+    if (v == self || v == self.rootViewController.view || (gWaterView && v == gWaterView)) return nil;
+    return v;
 }
 @end
 
@@ -337,20 +355,25 @@ static void WGEnsureOverlay(void) {
             WGLog(@"legacy app, use plain UIWindow");
         }
 
-        UIWindow *w = ws ? [[UIWindow alloc] initWithWindowScene:ws]
-                         : [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        WGOverlayWindow *w = ws ? [[WGOverlayWindow alloc] initWithWindowScene:ws]
+                                : [[WGOverlayWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
         w.frame = ws ? ws.coordinateSpace.bounds : [UIScreen mainScreen].bounds;
         w.windowLevel = UIWindowLevelAlert + 1;     // 高于宿主所有页面
         w.backgroundColor = [UIColor clearColor];
-        w.userInteractionEnabled = NO;              // 默认不拦截触摸
+        // 窗口本身必须可交互，否则按钮也点不到；空白区的穿透交给 WGOverlayWindow 的 hitTest 处理
+        w.userInteractionEnabled = YES;
         w.hidden = YES;
 
         WGOverlayController *vc = [[WGOverlayController alloc] init];
         w.rootViewController = vc;
 
-        WGWatermarkView *wm = [[WGWatermarkView alloc] initWithFrame:w.bounds];
+        // 水印层与按钮都挂在 rootViewController.view 上：
+        // 直接挂 UIWindow 会被 UIKit 的 window 视图重排盖到 root view 下面，导致按钮点不动。
+        UIView *rootView = vc.view;
+
+        WGWatermarkView *wm = [[WGWatermarkView alloc] initWithFrame:rootView.bounds];
         wm.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [w addSubview:wm];
+        [rootView addSubview:wm];
 
         // 屏幕下方「输入卡密」按钮：未授权时唯一可点的东西
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -362,10 +385,10 @@ static void WGEnsureOverlay(void) {
         b.translatesAutoresizingMaskIntoConstraints = NO;
         b.hidden = YES;
         [b addTarget:vc action:@selector(onActivateTap:) forControlEvents:UIControlEventTouchUpInside];
-        [w addSubview:b];
+        [rootView addSubview:b];
         [NSLayoutConstraint activateConstraints:@[
-            [b.centerXAnchor constraintEqualToAnchor:w.centerXAnchor],
-            [b.bottomAnchor constraintEqualToAnchor:w.safeAreaLayoutGuide.bottomAnchor constant:-36.0],
+            [b.centerXAnchor constraintEqualToAnchor:rootView.centerXAnchor],
+            [b.bottomAnchor constraintEqualToAnchor:rootView.safeAreaLayoutGuide.bottomAnchor constant:-36.0],
             [b.widthAnchor constraintEqualToConstant:136.0],
             [b.heightAnchor constraintEqualToConstant:38.0],
         ]];
@@ -377,6 +400,30 @@ static void WGEnsureOverlay(void) {
     } @catch (...) {
         WGLog(@"ensure overlay failed");
     }
+}
+
+/* 激活面板里要输入卡密：必须让覆盖窗口成为 key window，键盘才会挂到这个窗口上。
+ * 面板关闭后把 key window 还给宿主，避免影响宿主自己的输入框。 */
+static UIWindow *gPrevKeyWindow = nil;
+
+static void WGMakeOverlayKeyWindow(BOOL on) {
+    @try {
+        if (![NSThread isMainThread] || !gOverlayWindow) return;
+        if (on) {
+            UIWindow *prev = nil;
+            @try {
+                for (UIWindow *x in gOverlayWindow.windowScene.windows) {
+                    if (x != gOverlayWindow && x.isKeyWindow) { prev = x; break; }
+                }
+            } @catch (...) {}
+            if (prev) gPrevKeyWindow = prev;
+            [gOverlayWindow makeKeyWindow];
+        } else {
+            UIWindow *prev = gPrevKeyWindow;
+            gPrevKeyWindow = nil;
+            if (prev && prev != gOverlayWindow) [prev makeKeyWindow];
+        }
+    } @catch (...) {}
 }
 
 static void WGApplyWatermark(void) {
@@ -401,9 +448,10 @@ static void WGApplyWatermark(void) {
         [(WGWatermarkView *)gWaterView setText:text];
         BOOL show = (text.length != 0);
         gOverlayWindow.hidden = !show;
-        // 显示时整窗拦截触摸：未授权状态下宿主 App 不可操作，只有「输入卡密」按钮可点
-        gOverlayWindow.userInteractionEnabled = show;
-        gOverlayWindow.rootViewController.view.userInteractionEnabled = show;
+        // 注意：这里不能再动 userInteractionEnabled。
+        // 未授权时窗口要一直可交互，「输入卡密」按钮才点得动；
+        // 而窗口上除按钮/弹窗以外的区域由 WGOverlayWindow.hitTest 返回 nil 直接穿透给宿主，
+        // 所以没输入卡密也能正常操作 App（水印只是画在上面）。
         if (gActivateBtn) gActivateBtn.hidden = !show;   // 已授权（无水印）就收起激活入口
     } @catch (...) {
         WGLog(@"apply watermark failed");
@@ -474,7 +522,6 @@ static void WGShowInfoAlertRetry(NSString *title, NSString *message, NSString *m
             }
             gOverlayWindow.hidden = NO;
             gOverlayWindow.userInteractionEnabled = YES;
-            host.view.userInteractionEnabled = YES;
 
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                        message:message
@@ -522,10 +569,10 @@ static void WGShowActivationPanelRetry(int attempt) {
 
             gOverlayWindow.hidden = NO;
             gOverlayWindow.userInteractionEnabled = YES;
-            host.view.userInteractionEnabled = YES;
 
+            NSString *tips = @"输入卡密后点「激活」，激活成功后水印自动消失；不输入卡密也能继续使用 App，只是会一直保留水印。";
             NSString *svc = WGServiceSummary();
-            NSString *msg = svc.length ? svc : @"输入卡密后点「激活」。有效期由服务端计算，激活成功后水印自动消失。";
+            NSString *msg = svc.length ? [tips stringByAppendingFormat:@"\n\n%@", svc] : tips;
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"卡密激活"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
@@ -539,6 +586,7 @@ static void WGShowActivationPanelRetry(int attempt) {
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"激活" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                 @try {
+                    WGMakeOverlayKeyWindow(NO);     // 面板即将关闭，先把焦点还给宿主
                     NSString *code = ac.textFields.firstObject.text;
                     code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
                     if (code.length == 0) {
@@ -557,18 +605,25 @@ static void WGShowActivationPanelRetry(int attempt) {
             if (svc.length) {
                 [ac addAction:[UIAlertAction actionWithTitle:@"复制客服信息" style:UIAlertActionStyleDefault
                                                      handler:^(UIAlertAction *a) {
-                    @try { [UIPasteboard generalPasteboard].string = svc; } @catch (...) {}
+                    @try {
+                        [UIPasteboard generalPasteboard].string = svc;
+                        WGMakeOverlayKeyWindow(NO);
+                    } @catch (...) {}
                 }]];
             }
             if (gStrictMode) {
-                // 严格模式：不提供「关闭」，只能激活（不激活就强制退出 App）
+                // 严格模式：不激活就强制退出 App
                 [ac addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
                                                      handler:^(UIAlertAction *a) { exit(0); }]];
             } else {
-                // 水印模式：点「关闭」= 直接退出 App，不能关掉弹窗继续白用
-                [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDestructive
-                                                     handler:^(UIAlertAction *a) { exit(0); }]];
+                // 水印模式：关掉弹窗继续用 App，水印保留
+                [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel
+                                                     handler:^(UIAlertAction *a) {
+                    WGMakeOverlayKeyWindow(NO);
+                    WGApplyWatermark();
+                }]];
             }
+            WGMakeOverlayKeyWindow(YES);    // 让键盘挂到覆盖窗口上，卡密输入框才能输入
             [host presentViewController:ac animated:YES completion:nil];
         } @catch (...) {}
     });
@@ -733,7 +788,7 @@ static void WGPerformVerify(void) {
                               WGURLEncode(kWGAppID), WGURLEncode(kWGPlatform)];
 
             NSURL *url = [NSURL URLWithString:kWGVerifyURL];
-            if (!url) return;   // 地址配错：保持当前水印状态（未授权依旧锁屏）
+            if (!url) return;   // 地址配错：保持当前水印状态（未授权继续显示水印）
 
             NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
             req.HTTPMethod = @"POST";
@@ -746,7 +801,7 @@ static void WGPerformVerify(void) {
             [WGMakeVerifySession() dataTaskWithRequest:req
                                     completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
                 @try {
-                    // 网络失败 / 返回异常：不改变当前状态（未授权保持锁屏，已授权保持可用），避免断网即绕过
+                    // 网络失败 / 返回异常：不改变当前状态（未授权继续显示水印，已授权保持无水印），避免断网即绕过
                     if (err || data.length == 0) { WGLog(@"verify net error"); return; }
                     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
                     if (![obj isKindOfClass:[NSDictionary class]]) return;
@@ -760,7 +815,7 @@ static void WGPerformVerify(void) {
                             @{ @"code": code, @"ts": @([[NSDate date] timeIntervalSince1970]) }
                                                               forKey:kWGPassCacheKey];
                     }
-                    // 两种模式都是「全屏平铺水印 + 拦截触摸」，差别只在激活弹窗是否给「关闭」
+                    // 水印模式：pass=false 时铺满水印但 App 仍可操作（触摸穿透）；strict 模式同样铺水印，只是激活弹窗不给「关闭」
                     WGSetWatermark(pass ? YES : NO, text);
                     // 用户刚手动激活却失败 → 明确提示原因（定时校验的失败不打扰用户）
                     if (!pass && text.length &&
@@ -812,10 +867,9 @@ static void WGShowAnomalyAlert(NSString *message) {
             UIViewController *host = gOverlayWindow.rootViewController;
             if (!host || host.presentedViewController) return;
 
-            // 弹框前临时放开交互并确保窗口可见，关闭后恢复（不影响宿主触摸）
+            // 弹框前确保窗口可见（交互不受影响：空白区始终穿透给宿主）
             gOverlayWindow.hidden = NO;
             gOverlayWindow.userInteractionEnabled = YES;
-            host.view.userInteractionEnabled = YES;
 
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"环境异常"
                                                                       message:message
@@ -824,8 +878,6 @@ static void WGShowAnomalyAlert(NSString *message) {
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
                 @try {
-                    gOverlayWindow.userInteractionEnabled = NO;
-                    host.view.userInteractionEnabled = NO;
                     if (!WG_ENABLE_WATERMARK) {
                         // 水印关闭时 WGApplyWatermark 不会重算显隐，这里手动藏回窗口
                         gOverlayWindow.hidden = YES;
@@ -1071,7 +1123,7 @@ static void WGStartGuardTimer(void) {
                                   (uint64_t)(4 * NSEC_PER_SEC), (uint64_t)(1 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(t, ^{
             @try {
-                if (!WG_ENABLE_WATERMARK) return;       // 水印功能关闭时别造出看不见的全屏触摸拦截层
+                if (!WG_ENABLE_WATERMARK) return;       // 水印功能关闭时别造出看不见的全屏水印层
                 if (gWaterHidden) return;              // 已授权：窗口保持隐藏
                 WGEnsureOverlay();
                 if (!gOverlayWindow) return;
@@ -1201,11 +1253,13 @@ void WGStart(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ WGEnsureOverlay(); });
 
-        // 本地还没存过卡密 → 首次校验跑完（2 秒）后再弹激活窗口，此时客服信息已缓存
+        // 只有严格模式才在启动后自动弹激活窗口（不激活就用不了）；
+        // 水印模式不打扰用户，底部「输入卡密」按钮随时可点，激活前照常使用 App。
         gStrictMode = [[[NSUserDefaults standardUserDefaults] stringForKey:kWGModeCacheKey] isEqualToString:@"strict"];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
+                if (!gStrictMode) return;
                 id old = [[NSUserDefaults standardUserDefaults] objectForKey:kWGCardDefaultsKey];
                 NSString *code = [old isKindOfClass:[NSString class]] ? (NSString *)old : nil;
                 if (code.length == 0) WGShowActivationPanel();
