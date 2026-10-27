@@ -9,6 +9,11 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
+#ifndef _UINT_T_DEFINED
+#define _UINT_T_DEFINED
+typedef unsigned int uint_t;
+#endif
+
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
 typedef struct segment_command_64 segment_command_t;
