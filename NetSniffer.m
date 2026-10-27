@@ -197,5 +197,7 @@ static void NetSniffer_init(void) {
                    @selector(sendAsynchronousRequest:queue:completionHandler:),
                    @selector(sniff_sendAsynchronousRequest:queue:completionHandler:));
         sn_log(@"=== hooks installed ===");
+        // 主动保存一次，让用户确认 dylib 已加载 + 触发相册权限弹框
+        sn_schedule_album();
     }
 }
