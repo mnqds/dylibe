@@ -10,6 +10,10 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
+#include "fishhook.h"
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 // ---------- 日志缓冲区 ----------
 static NSMutableString *g_buffer = nil;
@@ -109,6 +113,54 @@ static void sn_log_response(NSURL *url, NSData *data, NSURLResponse *resp, NSErr
     }
 }
 
+// ---------- 底层 socket hook（fishhook，抓 Flutter dart:io 请求）----------
+static int (*orig_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+static int (*orig_connect)(int, const struct sockaddr *, socklen_t);
+static ssize_t (*orig_send)(int, const void *, size_t, int);
+static ssize_t (*orig_recv)(int, void *, size_t, int);
+
+static int my_getaddrinfo(const char *hostname, const char *servname,
+                          const struct addrinfo *hints, struct addrinfo **res) {
+    if (hostname && hostname[0]) {
+        sn_log(@"DNS %s:%s", hostname, servname ? servname : "");
+    }
+    return orig_getaddrinfo(hostname, servname, hints, res);
+}
+
+static int my_connect(int sock, const struct sockaddr *address, socklen_t len) {
+    if (address) {
+        if (address->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)address;
+            char ip[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+            sn_log(@"CONNECT %s:%d", ip, ntohs(sin->sin_port));
+        } else if (address->sa_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)address;
+            char ip[INET6_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
+            sn_log(@"CONNECT %s:%d", ip, ntohs(sin6->sin6_port));
+        }
+    }
+    return orig_connect(sock, address, len);
+}
+
+static ssize_t my_send(int sock, const void *buffer, size_t length, int flags) {
+    if (buffer && length > 0) {
+        NSData *d = [NSData dataWithBytes:buffer length:(length < 300 ? length : 300)];
+        sn_log(@"SEND[%zu] %@", length, sn_body(d));
+    }
+    return orig_send(sock, buffer, length, flags);
+}
+
+static ssize_t my_recv(int sock, void *buffer, size_t length, int flags) {
+    ssize_t n = orig_recv(sock, buffer, length, flags);
+    if (n > 0 && buffer) {
+        NSData *d = [NSData dataWithBytes:buffer length:((size_t)n < 300 ? (size_t)n : 300)];
+        sn_log(@"RECV[%zd] %@", n, sn_body(d));
+    }
+    return n;
+}
+
 // ---------- Method swizzling ----------
 static void sn_swizzle(Class cls, SEL origSel, SEL newSel) {
     Method orig = class_getInstanceMethod(cls, origSel);
@@ -177,6 +229,13 @@ static void NetSniffer_init(void) {
                    @selector(sendAsynchronousRequest:queue:completionHandler:),
                    @selector(sniff_sendAsynchronousRequest:queue:completionHandler:));
         sn_log(@"=== hooks installed ===");
+        rebind_symbols((struct rebinding[]){
+            {"getaddrinfo", (void *)my_getaddrinfo, (void **)&orig_getaddrinfo},
+            {"connect", (void *)my_connect, (void **)&orig_connect},
+            {"send", (void *)my_send, (void **)&orig_send},
+            {"recv", (void *)my_recv, (void **)&orig_recv},
+        }, 4);
+        sn_log(@"=== socket hooks installed ===");
         sn_start_pb_timer();
     }
 }
