@@ -1,0 +1,41 @@
+name: build-sniffer
+
+# 独立于 build-dylib 的抓包 dylib 编译
+on:
+  push:
+    paths:
+      - 'NetSniffer.m'
+      - '.github/workflows/build-sniffer.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译 NetSniffer.dylib (arm64 / iOS 14+)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -O2 -fvisibility=hidden \
+            -Wall -Wno-unused-function -Wno-deprecated-declarations \
+            -dynamiclib -install_name @executable_path/Frameworks/NetSniffer.dylib \
+            -framework Foundation -framework UIKit \
+            NetSniffer.m -o NetSniffer.dylib
+
+      - name: ad-hoc 签名
+        run: |
+          codesign -f -s - NetSniffer.dylib
+          file NetSniffer.dylib
+          xcrun --sdk iphoneos otool -L NetSniffer.dylib
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetSniffer-dylib
+          path: NetSniffer.dylib
+          if-no-files-found: error
+          retention-days: 30
