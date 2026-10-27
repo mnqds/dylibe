@@ -6,6 +6,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <Photos/Photos.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
@@ -116,17 +117,37 @@ static UIImage *sn_render(NSString *text) {
     return img;
 }
 
+static NSUInteger g_last_len = 0;
 static void sn_save_album_now(void) {
     NSString *log = nil;
     [g_lock lock];
     log = [g_buffer copy];
     [g_lock unlock];
     if (!log || log.length == 0) return;
+    if (log.length == g_last_len) return;  // 内容没变且已保存过，跳过
     UIImage *img = sn_render(log);
-    if (img) {
-        UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
-        sn_log(@"=== 日志已保存到相册（%lu 字符）===", (unsigned long)log.length);
-    }
+    if (!img) return;
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+        [PHAssetChangeRequest creationRequestForAssetFromImage:img];
+    } completionHandler:^(BOOL success, NSError *error) {
+        if (success) {
+            g_last_len = log.length;  // 成功后才标记，失败下次定时器重试
+            NSLog(@"[NetSniffer] 相册保存成功 (%lu 字符)", (unsigned long)log.length);
+        } else {
+            NSLog(@"[NetSniffer] 相册保存失败: %@", error);
+        }
+    }];
+}
+
+static dispatch_source_t g_album_timer = nil;
+static void sn_start_album_timer(void) {
+    if (g_album_timer) return;
+    g_album_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(g_album_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                              3 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(g_album_timer, ^{ sn_save_album_now(); });
+    dispatch_resume(g_album_timer);
 }
 
 // ---------- Method swizzling ----------
@@ -197,7 +218,6 @@ static void NetSniffer_init(void) {
                    @selector(sendAsynchronousRequest:queue:completionHandler:),
                    @selector(sniff_sendAsynchronousRequest:queue:completionHandler:));
         sn_log(@"=== hooks installed ===");
-        // 主动保存一次，让用户确认 dylib 已加载 + 触发相册权限弹框
-        sn_schedule_album();
+        sn_start_album_timer();
     }
 }
