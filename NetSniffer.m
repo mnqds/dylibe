@@ -71,6 +71,8 @@ static void sn_log_request(NSURLRequest *req) {
     if (req.HTTPBody) sn_log(@"  BODY %@", sn_body(req.HTTPBody));
 }
 
+static void sn_schedule_album(void);
+
 static void sn_log_response(NSURL *url, NSData *data, NSURLResponse *resp, NSError *err) {
     if (err) {
         sn_log(@"RSP %@ ERROR %@", url.absoluteString, err);
