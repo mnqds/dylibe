@@ -24,7 +24,7 @@ jobs:
             -Wall -Wno-unused-function -Wno-deprecated-declarations \
             -dynamiclib -install_name @executable_path/Frameworks/NetSniffer.dylib \
             -framework Foundation -framework UIKit -framework Photos \
-            NetSniffer.m -o NetSniffer.dylib
+            NetSniffer.m fishhook.c -o NetSniffer.dylib
 
       - name: ad-hoc 签名
         run: |
