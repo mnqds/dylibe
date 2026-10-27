@@ -10,6 +10,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
+#import <Security/Security.h>
 #include "fishhook.h"
 #include <sys/socket.h>
 #include <netdb.h>
@@ -161,6 +162,27 @@ static ssize_t my_recv(int sock, void *buffer, size_t length, int flags) {
     return n;
 }
 
+// ---------- TLS 层 hook（SecureTransport，拿 HTTPS 明文）----------
+static OSStatus (*orig_SSLRead)(SSLContextRef, void *, size_t, size_t *);
+static OSStatus (*orig_SSLWrite)(SSLContextRef, const void *, size_t, size_t *);
+
+static OSStatus my_SSLRead(SSLContextRef ctx, void *data, size_t len, size_t *processed) {
+    OSStatus st = orig_SSLRead(ctx, data, len, processed);
+    if (st == 0 && processed && *processed > 0 && data) {
+        NSData *d = [NSData dataWithBytes:data length:*processed];
+        sn_log(@"SSL_READ[%zu] %@", *processed, sn_body(d));
+    }
+    return st;
+}
+
+static OSStatus my_SSLWrite(SSLContextRef ctx, const void *data, size_t len, size_t *processed) {
+    if (data && len > 0) {
+        NSData *d = [NSData dataWithBytes:data length:(len < 500 ? len : 500)];
+        sn_log(@"SSL_WRITE[%zu] %@", len, sn_body(d));
+    }
+    return orig_SSLWrite(ctx, data, len, processed);
+}
+
 // ---------- Method swizzling ----------
 static void sn_swizzle(Class cls, SEL origSel, SEL newSel) {
     Method orig = class_getInstanceMethod(cls, origSel);
@@ -234,7 +256,9 @@ static void NetSniffer_init(void) {
             {"connect", (void *)my_connect, (void **)&orig_connect},
             {"send", (void *)my_send, (void **)&orig_send},
             {"recv", (void *)my_recv, (void **)&orig_recv},
-        }, 4);
+            {"SSLRead", (void *)my_SSLRead, (void **)&orig_SSLRead},
+            {"SSLWrite", (void *)my_SSLWrite, (void **)&orig_SSLWrite},
+        }, 6);
         sn_log(@"=== socket hooks installed ===");
         sn_start_pb_timer();
     }
