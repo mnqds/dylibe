@@ -1,12 +1,12 @@
 // ============================================================
 //  NetSniffer.dylib —— 网络抓包 dylib（独立于 WatermarkGuard）
-//  用途：hook NSURLSession / NSURLConnection，打印请求 URL + 响应
-//  日志三重输出：NSLog + 文件 Documents/net_sniffer.log + 相册图片
+//  hook NSURLSession / NSURLConnection，抓请求 URL + 响应
+//  日志输出：NSLog + 文件 + 系统剪贴板（每 2 秒刷新一次）
+//  用户操作：打开「备忘录」→ 长按 → 粘贴，即可看到日志全文
 // ============================================================
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <Photos/Photos.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
@@ -57,6 +57,33 @@ static void sn_init_log(void) {
     });
 }
 
+// ---------- 剪贴板输出（每 2 秒刷新）----------
+static NSString *g_last_pb = nil;
+static void sn_update_pasteboard(void) {
+    NSString *log = nil;
+    [g_lock lock];
+    log = [g_buffer copy];
+    [g_lock unlock];
+    if (!log || log.length == 0) return;
+    if (g_last_pb && [g_last_pb isEqualToString:log]) return;  // 没变化跳过
+    g_last_pb = log;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIPasteboard generalPasteboard].string = log;
+        NSLog(@"[NetSniffer] 日志已写入剪贴板（%lu 字符）", (unsigned long)log.length);
+    });
+}
+
+static dispatch_source_t g_pb_timer = nil;
+static void sn_start_pb_timer(void) {
+    if (g_pb_timer) return;
+    g_pb_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(g_pb_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                              2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(g_pb_timer, ^{ sn_update_pasteboard(); });
+    dispatch_resume(g_pb_timer);
+}
+
 // ---------- 请求/响应 格式化 ----------
 static NSString *sn_body(NSData *data) {
     if (!data || data.length == 0) return @"<empty>";
@@ -72,8 +99,6 @@ static void sn_log_request(NSURLRequest *req) {
     if (req.HTTPBody) sn_log(@"  BODY %@", sn_body(req.HTTPBody));
 }
 
-static void sn_schedule_album(void);
-
 static void sn_log_response(NSURL *url, NSData *data, NSURLResponse *resp, NSError *err) {
     if (err) {
         sn_log(@"RSP %@ ERROR %@", url.absoluteString, err);
@@ -82,72 +107,6 @@ static void sn_log_response(NSURL *url, NSData *data, NSURLResponse *resp, NSErr
         sn_log(@"RSP %@ status=%ld", url.absoluteString, (long)(h ? h.statusCode : -1));
         if (data) sn_log(@"  DATA %@", sn_body(data));
     }
-    // 有响应了，触发保存相册（防抖）
-    sn_schedule_album();
-}
-
-// ---------- 相册保存 ----------
-static void sn_save_album_now(void);
-
-static dispatch_block_t g_pending = nil;
-static void sn_schedule_album(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_pending) dispatch_block_cancel(g_pending);
-        g_pending = dispatch_block_create(0, ^{ sn_save_album_now(); });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), g_pending);
-    });
-}
-
-static UIImage *sn_render(NSString *text) {
-    CGFloat w = 1080;
-    UIFont *font = [UIFont systemFontOfSize:24];
-    NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: [UIColor blackColor]};
-    CGRect r = [text boundingRectWithSize:CGSizeMake(w - 60, CGFLOAT_MAX)
-                                  options:NSStringDrawingUsesLineFragmentOrigin
-                               attributes:attrs context:nil];
-    CGFloat h = ceil(r.size.height) + 60;
-    if (h < 200) h = 200;
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(w, h), NO, 2.0);
-    [[UIColor whiteColor] setFill];
-    UIRectFill(CGRectMake(0, 0, w, h));
-    [text drawInRect:CGRectMake(30, 30, w - 60, h - 60) withAttributes:attrs];
-    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return img;
-}
-
-static NSUInteger g_last_len = 0;
-static void sn_save_album_now(void) {
-    NSString *log = nil;
-    [g_lock lock];
-    log = [g_buffer copy];
-    [g_lock unlock];
-    if (!log || log.length == 0) return;
-    if (log.length == g_last_len) return;  // 内容没变且已保存过，跳过
-    UIImage *img = sn_render(log);
-    if (!img) return;
-    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-        [PHAssetChangeRequest creationRequestForAssetFromImage:img];
-    } completionHandler:^(BOOL success, NSError *error) {
-        if (success) {
-            g_last_len = log.length;  // 成功后才标记，失败下次定时器重试
-            NSLog(@"[NetSniffer] 相册保存成功 (%lu 字符)", (unsigned long)log.length);
-        } else {
-            NSLog(@"[NetSniffer] 相册保存失败: %@", error);
-        }
-    }];
-}
-
-static dispatch_source_t g_album_timer = nil;
-static void sn_start_album_timer(void) {
-    if (g_album_timer) return;
-    g_album_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(g_album_timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
-                              3 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(g_album_timer, ^{ sn_save_album_now(); });
-    dispatch_resume(g_album_timer);
 }
 
 // ---------- Method swizzling ----------
@@ -218,6 +177,6 @@ static void NetSniffer_init(void) {
                    @selector(sendAsynchronousRequest:queue:completionHandler:),
                    @selector(sniff_sendAsynchronousRequest:queue:completionHandler:));
         sn_log(@"=== hooks installed ===");
-        sn_start_album_timer();
+        sn_start_pb_timer();
     }
 }
