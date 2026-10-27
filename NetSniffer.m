@@ -1,18 +1,19 @@
 // ============================================================
 //  NetSniffer.dylib —— 网络抓包 dylib（独立于 WatermarkGuard）
 //  用途：hook NSURLSession / NSURLConnection，打印请求 URL + 响应
-//  目标：扒出「晒一晒」隐藏的 API 域名、登录请求/响应结构
-//  日志：NSLog（可用 idevicesyslog 实时看）+ 写文件 Documents/net_sniffer.log
+//  日志三重输出：NSLog + 文件 Documents/net_sniffer.log + 相册图片
 // ============================================================
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
 
-// ---------- 日志 helper ----------
-static NSString *g_logPath = nil;
+// ---------- 日志缓冲区 ----------
+static NSMutableString *g_buffer = nil;
 static NSRecursiveLock *g_lock = nil;
+static NSString *g_logPath = nil;
 
 static void sn_log(NSString *fmt, ...) {
     va_list args;
@@ -20,20 +21,24 @@ static void sn_log(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
 
-    // 1) 控制台日志（idevicesyslog / Xcode 可见）
     NSLog(@"[NetSniffer] %@", msg);
 
-    // 2) 写文件（保证不丢）
-    if (g_lock && g_logPath) {
+    if (g_lock) {
         [g_lock lock];
-        NSString *line = [msg stringByAppendingString:@"\n"];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
-        if (!fh) {
-            [line writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        } else {
-            [fh seekToEndOfFile];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
+        if (!g_buffer) g_buffer = [[NSMutableString alloc] init];
+        [g_buffer appendFormat:@"%@\n", msg];
+        if (g_buffer.length > 20000) {
+            [g_buffer deleteCharactersInRange:NSMakeRange(0, g_buffer.length - 20000)];
+        }
+        if (g_logPath) {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (!fh) {
+                [[msg stringByAppendingString:@"\n"] writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                [fh seekToEndOfFile];
+                [fh writeData:[[msg stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh closeFile];
+            }
         }
         [g_lock unlock];
     }
@@ -43,38 +48,83 @@ static void sn_init_log(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_lock = [[NSRecursiveLock alloc] init];
+        g_buffer = [[NSMutableString alloc] init];
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *doc = paths.count ? paths[0] : NSTemporaryDirectory();
         g_logPath = [doc stringByAppendingPathComponent:@"net_sniffer.log"];
-        sn_log(@"=== NetSniffer loaded, log file: %@ ===", g_logPath);
+        sn_log(@"=== NetSniffer loaded ===");
     });
 }
 
 // ---------- 请求/响应 格式化 ----------
 static NSString *sn_body(NSData *data) {
     if (!data || data.length == 0) return @"<empty>";
-    if (data.length > 8192) return [NSString stringWithFormat:@"<%lu bytes>", (unsigned long)data.length];
+    if (data.length > 6000) return [NSString stringWithFormat:@"<%lu bytes>", (unsigned long)data.length];
     NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (s) return s;
-    return [[NSString alloc] initWithData:data encoding:NSASCIIStringEncoding] ?: @"<binary>";
+    return s ?: @"<binary>";
 }
 
 static void sn_log_request(NSURLRequest *req) {
-    sn_log(@"▶ REQUEST  %@ %@", req.HTTPMethod ?: @"GET", req.URL.absoluteString ?: @"(nil)");
+    sn_log(@"REQ %@ %@", req.HTTPMethod ?: @"GET", req.URL.absoluteString ?: @"(nil)");
     NSDictionary *h = req.allHTTPHeaderFields;
-    if (h.count) sn_log(@"    HEADERS %@", h);
-    if (req.HTTPBody) sn_log(@"    BODY    %@", sn_body(req.HTTPBody));
-    if (req.HTTPBodyStream) sn_log(@"    BODY    <stream>");
+    if (h.count) sn_log(@"  HDR %@", h);
+    if (req.HTTPBody) sn_log(@"  BODY %@", sn_body(req.HTTPBody));
 }
 
 static void sn_log_response(NSURL *url, NSData *data, NSURLResponse *resp, NSError *err) {
     if (err) {
-        sn_log(@"◀ ERROR    %@  error=%@", url.absoluteString, err);
-        return;
+        sn_log(@"RSP %@ ERROR %@", url.absoluteString, err);
+    } else {
+        NSHTTPURLResponse *h = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
+        sn_log(@"RSP %@ status=%ld", url.absoluteString, (long)(h ? h.statusCode : -1));
+        if (data) sn_log(@"  DATA %@", sn_body(data));
     }
-    NSHTTPURLResponse *h = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
-    sn_log(@"◀ RESPONSE %@  status=%ld", url.absoluteString, (long)(h ? h.statusCode : -1));
-    if (data) sn_log(@"    DATA    %@", sn_body(data));
+    // 有响应了，触发保存相册（防抖）
+    sn_schedule_album();
+}
+
+// ---------- 相册保存 ----------
+static void sn_save_album_now(void);
+
+static dispatch_block_t g_pending = nil;
+static void sn_schedule_album(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_pending) dispatch_block_cancel(g_pending);
+        g_pending = dispatch_block_create(0, ^{ sn_save_album_now(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), g_pending);
+    });
+}
+
+static UIImage *sn_render(NSString *text) {
+    CGFloat w = 1080;
+    UIFont *font = [UIFont systemFontOfSize:24];
+    NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: [UIColor blackColor]};
+    CGRect r = [text boundingRectWithSize:CGSizeMake(w - 60, CGFLOAT_MAX)
+                                  options:NSStringDrawingUsesLineFragmentOrigin
+                               attributes:attrs context:nil];
+    CGFloat h = ceil(r.size.height) + 60;
+    if (h < 200) h = 200;
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(w, h), NO, 2.0);
+    [[UIColor whiteColor] setFill];
+    UIRectFill(CGRectMake(0, 0, w, h));
+    [text drawInRect:CGRectMake(30, 30, w - 60, h - 60) withAttributes:attrs];
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return img;
+}
+
+static void sn_save_album_now(void) {
+    NSString *log = nil;
+    [g_lock lock];
+    log = [g_buffer copy];
+    [g_lock unlock];
+    if (!log || log.length == 0) return;
+    UIImage *img = sn_render(log);
+    if (img) {
+        UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
+        sn_log(@"=== 日志已保存到相册（%lu 字符）===", (unsigned long)log.length);
+    }
 }
 
 // ---------- Method swizzling ----------
@@ -85,19 +135,14 @@ static void sn_swizzle(Class cls, SEL origSel, SEL newSel) {
     method_exchangeImplementations(orig, new);
 }
 
-// ============================================================
-//  NSURLSession  hook
-// ============================================================
 @interface NSURLSession (NetSniffer)
 - (NSURLSessionDataTask *)sniff_dataTaskWithRequest:(NSURLRequest *)request
                                  completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler;
 - (NSURLSessionDataTask *)sniff_dataTaskWithURL:(NSURL *)url
                              completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler;
-- (NSURLSessionDataTask *)sniff_dataTaskWithRequest:(NSURLRequest *)request;
 @end
 
 @implementation NSURLSession (NetSniffer)
-
 - (NSURLSessionDataTask *)sniff_dataTaskWithRequest:(NSURLRequest *)request
                                  completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
     sn_log_request(request);
@@ -105,36 +150,24 @@ static void sn_swizzle(Class cls, SEL origSel, SEL newSel) {
         sn_log_response(request.URL, data, resp, err);
         if (handler) handler(data, resp, err);
     };
-    // 注意：swizzle 后这里调用的是原始实现
     return [self sniff_dataTaskWithRequest:request completionHandler:wrapped];
 }
-
 - (NSURLSessionDataTask *)sniff_dataTaskWithURL:(NSURL *)url
                              completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
-    sn_log(@"▶ REQUEST  GET %@", url.absoluteString);
+    sn_log(@"REQ GET %@", url.absoluteString);
     void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
         sn_log_response(url, data, resp, err);
         if (handler) handler(data, resp, err);
     };
     return [self sniff_dataTaskWithURL:url completionHandler:wrapped];
 }
-
-- (NSURLSessionDataTask *)sniff_dataTaskWithRequest:(NSURLRequest *)request {
-    sn_log_request(request);
-    return [self sniff_dataTaskWithRequest:request];
-}
-
 @end
 
-// ============================================================
-//  NSURLConnection  hook（旧 API，有些库还在用）
-// ============================================================
 @interface NSURLConnection (NetSniffer)
 + (void)sniff_sendAsynchronousRequest:(NSURLRequest *)request
                                 queue:(NSOperationQueue *)queue
                     completionHandler:(void (^)(NSURLResponse *, NSData *, NSError *))handler;
 @end
-
 @implementation NSURLConnection (NetSniffer)
 + (void)sniff_sendAsynchronousRequest:(NSURLRequest *)request
                                 queue:(NSOperationQueue *)queue
@@ -148,30 +181,19 @@ static void sn_swizzle(Class cls, SEL origSel, SEL newSel) {
 }
 @end
 
-// ============================================================
-//  constructor：启动时自动 hook
-// ============================================================
 __attribute__((constructor))
 static void NetSniffer_init(void) {
     @autoreleasepool {
         sn_init_log();
-
-        // NSURLSession 实例方法
         sn_swizzle(objc_getClass("NSURLSession"),
                    @selector(dataTaskWithRequest:completionHandler:),
                    @selector(sniff_dataTaskWithRequest:completionHandler:));
         sn_swizzle(objc_getClass("NSURLSession"),
                    @selector(dataTaskWithURL:completionHandler:),
                    @selector(sniff_dataTaskWithURL:completionHandler:));
-        sn_swizzle(objc_getClass("NSURLSession"),
-                   @selector(dataTaskWithRequest:),
-                   @selector(sniff_dataTaskWithRequest:));
-
-        // NSURLConnection 类方法
         sn_swizzle(objc_getMetaClass("NSURLConnection"),
                    @selector(sendAsynchronousRequest:queue:completionHandler:),
                    @selector(sniff_sendAsynchronousRequest:queue:completionHandler:));
-
-        sn_log(@"=== NetSniffer hooks installed (NSURLSession + NSURLConnection) ===");
+        sn_log(@"=== hooks installed ===");
     }
 }
