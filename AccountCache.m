@@ -3,7 +3,6 @@
 #import <objc/runtime.h>
 #import <sqlite3.h>
 
-// ===== 读数据库 =====
 static NSDictionary *LoadAccountRow(NSString *tableName, NSString *pkid) {
     if (pkid.length == 0) return nil;
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -54,55 +53,25 @@ static void ApplyRowToModel(id model, NSDictionary *row) {
     }
 }
 
-// ===== hook setUser: =====
-typedef void (*SetUserImp)(id, SEL, id);
-static SetUserImp orig_Wx_setUser = NULL;
+// ===== hook getCurrentUser =====
+typedef id (*GetUserImp)(id, SEL);
+static GetUserImp orig_Wx_getCurrentUser = NULL;
+static GetUserImp orig_Zfb_getCurrentUser = NULL;
 
-static void swizzled_Wx_setUser(id self, SEL _cmd, id user) {
-    orig_Wx_setUser(self, _cmd, user);
+static id swizzled_Wx_getCurrentUser(id self, SEL _cmd) {
+    id user = orig_Wx_getCurrentUser(self, _cmd);
     NSString *currentId = [[NSUserDefaults standardUserDefaults] stringForKey:@"WeChatCurrentId"];
     NSDictionary *row = LoadAccountRow(@"wechat_user", currentId);
-    if (row) {
-        ApplyRowToModel(user, row);
-        NSLog(@"[AccountCache] 微信 setUser 回填完成");
-    }
+    if (row) { ApplyRowToModel(user, row); NSLog(@"[AccountCache] 微信 getCurrentUser 回填完成"); }
+    return user;
 }
 
-// ===== hook viewDidLoad（兜底：支付宝"我的"页 + 其他）=====
-typedef void (*VoidImp)(id, SEL);
-static VoidImp orig_Zfb_viewDidLoad = NULL;
-static VoidImp orig_Wx_viewDidLoad = NULL;
-
-static void zfb_backfill(id self) {
+static id swizzled_Zfb_getCurrentUser(id self, SEL _cmd) {
+    id user = orig_Zfb_getCurrentUser(self, _cmd);
     NSString *currentId = [[NSUserDefaults standardUserDefaults] stringForKey:@"ZFBCurrentId"];
     NSDictionary *row = LoadAccountRow(@"zfb_user", currentId);
-    if (!row) return;
-    id account = nil;
-    @try { account = [self valueForKey:@"currentAccount"]; } @catch (NSException *e) {}
-    if (!account) {
-        @try { account = [self valueForKey:@"person"]; } @catch (NSException *e) {}
-    }
-    if (account) { ApplyRowToModel(account, row); NSLog(@"[AccountCache] 支付宝回填完成"); }
-}
-
-static void swizzled_Zfb_viewDidLoad(id self, SEL _cmd) {
-    orig_Zfb_viewDidLoad(self, _cmd);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        zfb_backfill(self);
-    });
-}
-
-static void swizzled_Wx_viewDidLoad(id self, SEL _cmd) {
-    orig_Wx_viewDidLoad(self, _cmd);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        NSString *currentId = [[NSUserDefaults standardUserDefaults] stringForKey:@"WeChatCurrentId"];
-        NSDictionary *row = LoadAccountRow(@"wechat_user", currentId);
-        if (!row) return;
-        id account = nil;
-        @try { account = [self valueForKey:@"user"]; } @catch (NSException *e) {}
-        if (!account) { @try { account = [self valueForKey:@"currentAccount"]; } @catch (NSException *e) {} }
-        if (account) { ApplyRowToModel(account, row); NSLog(@"[AccountCache] 微信 viewDidLoad 回填完成"); }
-    });
+    if (row) { ApplyRowToModel(user, row); NSLog(@"[AccountCache] 支付宝 getCurrentUser 回填完成"); }
+    return user;
 }
 
 static void Swizzle(Class cls, SEL sel, IMP newImp, IMP *origImp) {
@@ -115,15 +84,19 @@ static void Swizzle(Class cls, SEL sel, IMP newImp, IMP *origImp) {
 __attribute__((constructor))
 static void AccountCacheInit(void) {
     NSLog(@"[AccountCache] 已加载");
-    Class wxMine = NSClassFromString(@"WeChatMineViewController");
-    if (wxMine) {
-        Swizzle(wxMine, @selector(setUser:), (IMP)swizzled_Wx_setUser, (IMP *)&orig_Wx_setUser);
-        Swizzle(wxMine, @selector(viewDidLoad), (IMP)swizzled_Wx_viewDidLoad, (IMP *)&orig_Wx_viewDidLoad);
-        NSLog(@"[AccountCache] 已 hook WeChatMineViewController");
+    Class wxTool = NSClassFromString(@"WeChatHandelTool");
+    if (wxTool) {
+        Swizzle(wxTool, @selector(getCurrentUser), (IMP)swizzled_Wx_getCurrentUser, (IMP *)&orig_Wx_getCurrentUser);
+        NSLog(@"[AccountCache] 已 hook WeChatHandelTool getCurrentUser");
+    } else {
+        NSLog(@"[AccountCache] 未找到 WeChatHandelTool");
     }
-    Class zfbMine = NSClassFromString(@"ZFBMineViewController");
-    if (zfbMine) {
-        Swizzle(zfbMine, @selector(viewDidLoad), (IMP)swizzled_Zfb_viewDidLoad, (IMP *)&orig_Zfb_viewDidLoad);
-        NSLog(@"[AccountCache] 已 hook ZFBMineViewController");
+
+    // 支付宝侧也尝试同名方法
+    Class zfbTool = NSClassFromString(@"ZFBHandelTool");
+    if (!zfbTool) zfbTool = NSClassFromString(@"ZFBHandleTool");
+    if (zfbTool) {
+        Swizzle(zfbTool, @selector(getCurrentUser), (IMP)swizzled_Zfb_getCurrentUser, (IMP *)&orig_Zfb_getCurrentUser);
+        NSLog(@"[AccountCache] 已 hook 支付宝 getCurrentUser");
     }
 }
