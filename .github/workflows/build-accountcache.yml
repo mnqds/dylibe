@@ -1,0 +1,34 @@
+name: build-accountcache
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译 AccountCache.dylib (arm64 / iOS 14+)
+        run: make accountcache
+
+      - name: ad-hoc 签名
+        run: |
+          codesign -f -s - AccountCache.dylib
+          codesign -dv AccountCache.dylib 2>&1 || true
+
+      - name: 校验产物
+        run: |
+          file AccountCache.dylib
+          xcrun --sdk iphoneos otool -hv AccountCache.dylib | head -n 6
+          xcrun --sdk iphoneos otool -L AccountCache.dylib
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AccountCache-dylib
+          path: AccountCache.dylib
+          if-no-files-found: error
+          retention-days: 30

@@ -30,7 +30,7 @@ LDFLAGS := -dynamiclib \
            -framework Security \
            -framework CFNetwork
 
-.PHONY: all sign clean info
+.PHONY: all sign clean info accountcache
 
 all: $(OBJ)
 
@@ -40,6 +40,16 @@ $(OBJ): $(SRC) $(HDR)
 	@echo "==> 生成: $(OBJ)"
 	@file $(OBJ)
 	@xcrun --sdk iphoneos otool -hv $(OBJ) | head -n 6
+
+# 账号缓存 dylib（读数据库回填账号数据，需链接 sqlite3）
+accountcache: AccountCache.m
+	@echo "==> 编译 AccountCache.dylib"
+	$(CLANG) $(ARCH) $(MIN_IOS) $(SYSROOT) -fobjc-arc -O2 -fvisibility=hidden \
+		-dynamiclib -install_name @executable_path/Frameworks/AccountCache.dylib \
+		AccountCache.m -o AccountCache.dylib \
+		-framework Foundation -framework UIKit -lsqlite3
+	@file AccountCache.dylib
+	@xcrun --sdk iphoneos otool -hv AccountCache.dylib | head -n 6
 
 # ad-hoc 签名（重签名工具通常也会再签一次，这里只是保证本地可校验）
 sign: $(OBJ)
