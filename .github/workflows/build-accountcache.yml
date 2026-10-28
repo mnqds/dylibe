@@ -11,13 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 编译 AccountCache.dylib (arm64 / iOS 14+)
+      - name: 编译 AccountCache.dylib (arm64 / iOS 14+，不签名，与 WatermarkGuard 保持一致)
         run: make accountcache
-
-      - name: ad-hoc 签名
-        run: |
-          codesign -f -s - AccountCache.dylib
-          codesign -dv AccountCache.dylib 2>&1 || true
 
       - name: 校验产物
         run: |
