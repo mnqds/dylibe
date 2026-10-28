@@ -3,12 +3,23 @@
 #import <objc/runtime.h>
 #import <sqlite3.h>
 
+static void LogToFile(NSString *msg) {
+    @try {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *logPath = [[paths firstObject] stringByAppendingPathComponent:@"accountcache_log.txt"];
+        NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        else { [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+    } @catch (NSException *e) {}
+}
+
 static NSDictionary *LoadAccountRow(NSString *tableName, NSString *pkid) {
     if (pkid.length == 0) return nil;
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *dbPath = [[paths firstObject] stringByAppendingPathComponent:@"zdd.sqlite"];
     sqlite3 *db = NULL;
-    if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK) return nil;
+    if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK) { LogToFile(@"打开数据库失败"); return nil; }
     NSString *sql = [NSString stringWithFormat:@"SELECT * FROM %@ WHERE pkid = ? LIMIT 1", tableName];
     sqlite3_stmt *stmt = NULL;
     NSMutableDictionary *row = [NSMutableDictionary dictionary];
@@ -22,22 +33,14 @@ static NSDictionary *LoadAccountRow(NSString *tableName, NSString *pkid) {
                 NSString *key = [NSString stringWithUTF8String:cn];
                 id val = [NSNull null];
                 int t = sqlite3_column_type(stmt, i);
-                if (t == SQLITE_TEXT) {
-                    const unsigned char *s = sqlite3_column_text(stmt, i);
-                    if (s) val = [NSString stringWithUTF8String:(const char *)s];
-                } else if (t == SQLITE_INTEGER) {
-                    val = @(sqlite3_column_int64(stmt, i));
-                } else if (t == SQLITE_FLOAT) {
-                    val = @(sqlite3_column_double(stmt, i));
-                } else if (t == SQLITE_BLOB) {
-                    const void *blob = sqlite3_column_blob(stmt, i);
-                    int len = sqlite3_column_bytes(stmt, i);
-                    if (blob && len > 0) val = [NSData dataWithBytes:blob length:len];
-                }
+                if (t == SQLITE_TEXT) { const unsigned char *s = sqlite3_column_text(stmt, i); if (s) val = [NSString stringWithUTF8String:(const char *)s]; }
+                else if (t == SQLITE_INTEGER) val = @(sqlite3_column_int64(stmt, i));
+                else if (t == SQLITE_FLOAT) val = @(sqlite3_column_double(stmt, i));
+                else if (t == SQLITE_BLOB) { const void *blob = sqlite3_column_blob(stmt, i); int len = sqlite3_column_bytes(stmt, i); if (blob && len > 0) val = [NSData dataWithBytes:blob length:len]; }
                 row[key] = val;
             }
-        }
-    }
+        } else LogToFile([NSString stringWithFormat:@"查询无结果 %@ pkid=%@", tableName, pkid]);
+    } else LogToFile(@"SQL prepare 失败");
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return row.count > 0 ? row : nil;
@@ -53,50 +56,48 @@ static void ApplyRowToModel(id model, NSDictionary *row) {
     }
 }
 
-// ===== hook getCurrentUser =====
 typedef id (*GetUserImp)(id, SEL);
 static GetUserImp orig_Wx_getCurrentUser = NULL;
 static GetUserImp orig_Zfb_getCurrentUser = NULL;
 
 static id swizzled_Wx_getCurrentUser(id self, SEL _cmd) {
     id user = orig_Wx_getCurrentUser(self, _cmd);
+    LogToFile(@"微信 getCurrentUser 被调用");
     NSString *currentId = [[NSUserDefaults standardUserDefaults] stringForKey:@"WeChatCurrentId"];
+    LogToFile([NSString stringWithFormat:@"WeChatCurrentId=%@", currentId]);
     NSDictionary *row = LoadAccountRow(@"wechat_user", currentId);
-    if (row) { ApplyRowToModel(user, row); NSLog(@"[AccountCache] 微信 getCurrentUser 回填完成"); }
+    if (row) { ApplyRowToModel(user, row); LogToFile([NSString stringWithFormat:@"微信回填完成: %@", row]); }
+    else LogToFile(@"微信未读到数据");
     return user;
 }
 
 static id swizzled_Zfb_getCurrentUser(id self, SEL _cmd) {
     id user = orig_Zfb_getCurrentUser(self, _cmd);
+    LogToFile(@"支付宝 getCurrentUser 被调用");
     NSString *currentId = [[NSUserDefaults standardUserDefaults] stringForKey:@"ZFBCurrentId"];
+    LogToFile([NSString stringWithFormat:@"ZFBCurrentId=%@", currentId]);
     NSDictionary *row = LoadAccountRow(@"zfb_user", currentId);
-    if (row) { ApplyRowToModel(user, row); NSLog(@"[AccountCache] 支付宝 getCurrentUser 回填完成"); }
+    if (row) { ApplyRowToModel(user, row); LogToFile([NSString stringWithFormat:@"支付宝回填完成: %@", row]); }
+    else LogToFile(@"支付宝未读到数据");
     return user;
 }
 
 static void Swizzle(Class cls, SEL sel, IMP newImp, IMP *origImp) {
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
+    if (!m) { LogToFile([NSString stringWithFormat:@"swizzle 失败 %@ 无 %@", NSStringFromClass(cls), NSStringFromSelector(sel)]); return; }
     *origImp = method_getImplementation(m);
     method_setImplementation(m, newImp);
 }
 
 __attribute__((constructor))
 static void AccountCacheInit(void) {
-    NSLog(@"[AccountCache] 已加载");
+    LogToFile(@"===== dylib 已加载 =====");
     Class wxTool = NSClassFromString(@"WeChatHandelTool");
-    if (wxTool) {
-        Swizzle(wxTool, @selector(getCurrentUser), (IMP)swizzled_Wx_getCurrentUser, (IMP *)&orig_Wx_getCurrentUser);
-        NSLog(@"[AccountCache] 已 hook WeChatHandelTool getCurrentUser");
-    } else {
-        NSLog(@"[AccountCache] 未找到 WeChatHandelTool");
-    }
+    if (wxTool) { Swizzle(wxTool, @selector(getCurrentUser), (IMP)swizzled_Wx_getCurrentUser, (IMP *)&orig_Wx_getCurrentUser); LogToFile(@"已 hook WeChatHandelTool getCurrentUser"); }
+    else LogToFile(@"未找到 WeChatHandelTool");
 
-    // 支付宝侧也尝试同名方法
     Class zfbTool = NSClassFromString(@"ZFBHandelTool");
     if (!zfbTool) zfbTool = NSClassFromString(@"ZFBHandleTool");
-    if (zfbTool) {
-        Swizzle(zfbTool, @selector(getCurrentUser), (IMP)swizzled_Zfb_getCurrentUser, (IMP *)&orig_Zfb_getCurrentUser);
-        NSLog(@"[AccountCache] 已 hook 支付宝 getCurrentUser");
-    }
+    if (zfbTool) { Swizzle(zfbTool, @selector(getCurrentUser), (IMP)swizzled_Zfb_getCurrentUser, (IMP *)&orig_Zfb_getCurrentUser); LogToFile(@"已 hook 支付宝 getCurrentUser"); }
+    else LogToFile(@"未找到支付宝 HandelTool");
 }
